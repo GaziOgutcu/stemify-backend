@@ -1,2 +1,0 @@
-# stemify-backend
-stemify-backend
