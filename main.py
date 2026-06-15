@@ -8,13 +8,18 @@ import subprocess
 import threading
 from pathlib import Path
 
-# Auto-configure ffmpeg
-try:
-    import static_ffmpeg
-    static_ffmpeg.add_paths()
+import static_ffmpeg
+
+# Auto-configure ffmpeg. Prefer a system ffmpeg when available, and do not let
+# static-ffmpeg download/network failures prevent the API from starting.
+if shutil.which("ffmpeg"):
     print("[OK] ffmpeg ready")
-except ImportError:
-    pass
+else:
+    try:
+        static_ffmpeg.add_paths()
+        print("[OK] ffmpeg ready")
+    except Exception as exc:
+        print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,11 +47,9 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 
 STEM_MODELS = {
-    2:  "htdemucs",
-    4:  "htdemucs",
-    6:  "htdemucs_6s",
-    8:  "htdemucs_6s",
-    10: "htdemucs_6s",
+    2: "htdemucs",
+    4: "htdemucs",
+    6: "htdemucs_6s",
 }
 
 # In-memory job store
@@ -68,6 +71,10 @@ async def split_audio(
     file: UploadFile = File(...),
     stems: int = Form(4),
 ):
+    if stems not in STEM_MODELS:
+        allowed_stems = ", ".join(str(value) for value in sorted(STEM_MODELS))
+        raise HTTPException(400, f"Unsupported stem count: {stems}. Allowed values: {allowed_stems}.")
+
     suffix = Path(file.filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {suffix}")
