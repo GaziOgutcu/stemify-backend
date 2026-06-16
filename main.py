@@ -58,9 +58,9 @@ DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 
 STEM_MODELS = {
-    2: "mdx_q",
-    4: "mdx_q",
-    6: "mdx_q",
+    2: "htdemucs",
+    4: "htdemucs",
+    6: "htdemucs_6s",
 }
 
 # In-memory job store. This is intentionally simple for a single-instance API;
