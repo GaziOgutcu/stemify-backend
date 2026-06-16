@@ -58,9 +58,9 @@ DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 
 STEM_MODELS = {
-    2: "htdemucs",
-    4: "htdemucs",
-    6: "htdemucs_6s",
+    2: "mdx_q",
+    4: "mdx_q",
+    6: "mdx_q",
 }
 
 # In-memory job store. This is intentionally simple for a single-instance API;
@@ -155,8 +155,11 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
             cmd += ["--two-stems", "vocals"]
         cmd.append(str(input_path))
 
-        print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}")
+        print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DEMUCS_TIMEOUT_SECONDS)
+        print(f"[JOB {job_id[:8]}] STDOUT:\n{proc.stdout[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] STDERR:\n{proc.stderr[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] RETURN CODE: {proc.returncode}", flush=True)
 
         if proc.returncode != 0:
             err = (proc.stderr or "") + (proc.stdout or "")
