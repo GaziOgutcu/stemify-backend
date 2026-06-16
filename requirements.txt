@@ -5,4 +5,5 @@ demucs==4.0.1
 torch>=2.0.0
 torchaudio>=2.0.0
 static-ffmpeg>=2.5
-torchcodec==0.2.0
+torchcodec
+diffq
