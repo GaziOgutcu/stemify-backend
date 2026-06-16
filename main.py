@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import secrets
@@ -5,6 +6,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import zipfile
 from hashlib import pbkdf2_hmac
@@ -28,7 +32,7 @@ else:
     except Exception as exc:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
-app = FastAPI(title="Stemify API", version="1.2.0")
+app = FastAPI(title="Stemify API", version="1.3.0")
 
 
 def _split_csv_env(name: str, default: str = "") -> list[str]:
@@ -59,6 +63,21 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
+PRICE_PER_STEM_CENTS = int(os.getenv("PRICE_PER_STEM_CENTS", "300"))
+PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "false").lower() == "true"
+PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "usd").lower()
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+SOCIAL_AUTH_PROVIDERS = {
+    "google": {
+        "display_name": "Google",
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+    },
+    "apple": {
+        "display_name": "Apple",
+        "client_id": os.getenv("APPLE_CLIENT_ID", ""),
+    },
+}
 
 STEM_MODELS = {
     2: "htdemucs",
@@ -80,6 +99,8 @@ USERS: dict[str, dict[str, Any]] = {}
 TOKENS: dict[str, str] = {}
 AUTH_LOCK = threading.Lock()
 PASSWORD_ITERATIONS = 390_000
+PAYMENTS: dict[str, dict[str, Any]] = {}
+PAYMENTS_LOCK = threading.Lock()
 
 
 class AuthRequest(BaseModel):
@@ -96,6 +117,16 @@ class UserProfile(BaseModel):
 class AuthResponse(BaseModel):
     token: str
     user: UserProfile
+
+
+class CheckoutRequest(BaseModel):
+    job_id: str
+    item_type: str = Field(pattern="^(zip|stem)$")
+    filename: str | None = Field(default=None, max_length=120)
+
+
+class ConfirmPaymentRequest(BaseModel):
+    checkout_session_id: str
 
 
 def normalize_email(email: str) -> str:
@@ -168,6 +199,81 @@ def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
         return job.copy()
 
 
+def payment_key(job_id: str, item_type: str, filename: str | None = None) -> str:
+    return f"{job_id}:{item_type}:{filename or 'all'}"
+
+
+def is_payment_required() -> bool:
+    return PAYMENTS_ENABLED
+
+
+def is_download_paid(job_id: str, user: dict[str, Any], item_type: str, filename: str | None = None) -> bool:
+    if not is_payment_required():
+        return True
+
+    key = payment_key(job_id, item_type, filename)
+    zip_key = payment_key(job_id, "zip")
+    with PAYMENTS_LOCK:
+        return any(
+            payment
+            for payment in PAYMENTS.values()
+            if payment.get("user_email") == user["email"]
+            and payment.get("status") == "paid"
+            and payment.get("payment_key") in {key, zip_key}
+        )
+
+
+def enforce_paid_download(job: dict[str, Any], user: dict[str, Any], item_type: str, filename: str | None = None) -> None:
+    if is_download_paid(job["job_id"], user, item_type, filename):
+        return
+
+    raise HTTPException(
+        402,
+        {
+            "message": "Payment required before download.",
+            "price_per_stem_cents": PRICE_PER_STEM_CENTS,
+            "currency": PAYMENT_CURRENCY,
+            "checkout_endpoint": "/api/payments/checkout",
+        },
+    )
+
+
+def checkout_amount_for_job(job: dict[str, Any], item_type: str) -> tuple[int, str]:
+    if item_type == "stem":
+        return PRICE_PER_STEM_CENTS, "Stemify single stem download"
+
+    stem_count = max(len(job.get("stems") or []), int(job.get("requested_stems") or 1))
+    return PRICE_PER_STEM_CENTS * stem_count, f"Stemify ZIP download ({stem_count} stems)"
+
+
+def stripe_request(method: str, path: str, data: dict[str, str] | None = None) -> dict[str, Any]:
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe is not configured.")
+
+    encoded_data = urllib.parse.urlencode(data or {}).encode("utf-8") if data is not None else None
+    request = urllib.request.Request(
+        f"https://api.stripe.com/v1{path}",
+        data=encoded_data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {STRIPE_SECRET_KEY}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json_loads(response.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(exc.code, f"Stripe error: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(503, f"Stripe request failed: {exc.reason}") from exc
+
+
+def json_loads(raw: bytes) -> dict[str, Any]:
+    return json.loads(raw.decode("utf-8"))
+
+
 @app.get("/api")
 async def root():
     return {
@@ -176,6 +282,11 @@ async def root():
         "version": app.version,
         "allowed_stems": sorted(STEM_MODELS),
         "max_file_size_mb": MAX_FILE_SIZE_MB,
+        "payments": {
+            "enabled": PAYMENTS_ENABLED,
+            "price_per_stem_cents": PRICE_PER_STEM_CENTS,
+            "currency": PAYMENT_CURRENCY,
+        },
     }
 
 
@@ -220,6 +331,104 @@ async def me(user: Annotated[dict[str, Any], Depends(current_user)]):
     return UserProfile(**public_user(user))
 
 
+@app.get("/api/auth/social/providers")
+async def social_auth_providers():
+    return {
+        "providers": [
+            {
+                "provider": provider,
+                "display_name": details["display_name"],
+                "enabled": bool(details["client_id"]),
+                "client_id": details["client_id"] or None,
+            }
+            for provider, details in SOCIAL_AUTH_PROVIDERS.items()
+        ],
+        "note": "Use the provider SDK on the frontend, then add a backend token-verification callback before production.",
+    }
+
+
+@app.get("/api/payments/config")
+async def payments_config():
+    return {
+        "enabled": PAYMENTS_ENABLED,
+        "provider": "stripe" if PAYMENTS_ENABLED else None,
+        "price_per_stem_cents": PRICE_PER_STEM_CENTS,
+        "currency": PAYMENT_CURRENCY,
+    }
+
+
+@app.post("/api/payments/checkout")
+async def create_checkout_session(
+    payload: CheckoutRequest,
+    user: Annotated[dict[str, Any], Depends(current_user)],
+):
+    if not PAYMENTS_ENABLED:
+        raise HTTPException(400, "Payments are disabled.")
+
+    job = get_authorized_job(payload.job_id, user)
+    filename = payload.filename if payload.item_type == "stem" else None
+    if payload.item_type == "stem" and not filename:
+        raise HTTPException(400, "A stem filename is required for stem checkout.")
+
+    amount_cents, product_name = checkout_amount_for_job(job, payload.item_type)
+    session = stripe_request(
+        "POST",
+        "/checkout/sessions",
+        {
+            "mode": "payment",
+            "customer_email": user["email"],
+            "success_url": f"{FRONTEND_URL}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{FRONTEND_URL}/checkout/cancel",
+            "line_items[0][quantity]": "1",
+            "line_items[0][price_data][currency]": PAYMENT_CURRENCY,
+            "line_items[0][price_data][unit_amount]": str(amount_cents),
+            "line_items[0][price_data][product_data][name]": product_name,
+            "metadata[job_id]": payload.job_id,
+            "metadata[item_type]": payload.item_type,
+            "metadata[filename]": filename or "",
+            "metadata[user_email]": user["email"],
+        },
+    )
+
+    with PAYMENTS_LOCK:
+        PAYMENTS[session["id"]] = {
+            "checkout_session_id": session["id"],
+            "payment_key": payment_key(payload.job_id, payload.item_type, filename),
+            "job_id": payload.job_id,
+            "item_type": payload.item_type,
+            "filename": filename,
+            "user_email": user["email"],
+            "status": "pending",
+            "amount_cents": amount_cents,
+            "currency": PAYMENT_CURRENCY,
+        }
+
+    return {"checkout_session_id": session["id"], "checkout_url": session.get("url")}
+
+
+@app.post("/api/payments/confirm")
+async def confirm_checkout_session(
+    payload: ConfirmPaymentRequest,
+    user: Annotated[dict[str, Any], Depends(current_user)],
+):
+    if not PAYMENTS_ENABLED:
+        raise HTTPException(400, "Payments are disabled.")
+
+    with PAYMENTS_LOCK:
+        payment = PAYMENTS.get(payload.checkout_session_id)
+    if not payment or payment.get("user_email") != user["email"]:
+        raise HTTPException(404, "Payment not found.")
+
+    session = stripe_request("GET", f"/checkout/sessions/{urllib.parse.quote(payload.checkout_session_id)}")
+    if session.get("payment_status") != "paid":
+        return {"status": "pending", "payment_status": session.get("payment_status")}
+
+    with PAYMENTS_LOCK:
+        payment["status"] = "paid"
+        payment["stripe_payment_status"] = session.get("payment_status")
+    return {"status": "paid", "job_id": payment["job_id"], "item_type": payment["item_type"]}
+
+
 @app.post("/api/split")
 async def split_audio(
     user: Annotated[dict[str, Any], Depends(current_user)],
@@ -260,6 +469,7 @@ async def split_audio(
             "error": None,
             "track_name": safe_stem,
             "user_email": user["email"],
+            "requested_stems": stems,
         }
     with AUTH_LOCK:
         user["jobs_created"] += 1
@@ -339,7 +549,8 @@ async def job_status(job_id: str, user: Annotated[dict[str, Any], Depends(curren
 
 @app.get("/api/download/{job_id}/zip")
 async def download_zip(job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
-    get_authorized_job(job_id, user)
+    job = get_authorized_job(job_id, user)
+    enforce_paid_download(job, user, "zip")
     job_dir = OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
@@ -358,7 +569,8 @@ async def download_stem(
     if not SAFE_DOWNLOAD_RE.fullmatch(filename):
         raise HTTPException(400, "Invalid stem filename.")
 
-    get_authorized_job(job_id, user)
+    job = get_authorized_job(job_id, user)
+    enforce_paid_download(job, user, "stem", filename)
     job_dir = OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")

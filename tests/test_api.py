@@ -14,10 +14,12 @@ def reset_auth_state():
     main.USERS.clear()
     main.TOKENS.clear()
     main.JOBS.clear()
+    main.PAYMENTS.clear()
     yield
     main.USERS.clear()
     main.TOKENS.clear()
     main.JOBS.clear()
+    main.PAYMENTS.clear()
 
 
 def auth_headers(email="tester@example.com", password="password123"):
@@ -63,6 +65,27 @@ def test_signin_rejects_bad_password():
 
     assert response.status_code == 401
     assert "Invalid email or password" in response.json()["detail"]
+
+
+def test_social_auth_providers_show_configured_options(monkeypatch):
+    monkeypatch.setitem(main.SOCIAL_AUTH_PROVIDERS["google"], "client_id", "google-client")
+    monkeypatch.setitem(main.SOCIAL_AUTH_PROVIDERS["apple"], "client_id", "")
+
+    response = client.get("/api/auth/social/providers")
+
+    assert response.status_code == 200
+    providers = {provider["provider"]: provider for provider in response.json()["providers"]}
+    assert providers["google"]["enabled"] is True
+    assert providers["google"]["client_id"] == "google-client"
+    assert providers["apple"]["enabled"] is False
+
+
+def test_payments_config_defaults_to_disabled():
+    response = client.get("/api/payments/config")
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is False
+    assert response.json()["price_per_stem_cents"] == 300
 
 
 def test_split_requires_authentication():
@@ -148,3 +171,25 @@ def test_download_zip_returns_ready_archive(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
+
+
+def test_download_zip_requires_payment_when_enabled(tmp_path, monkeypatch):
+    job_id = "paid-zip-test"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    job_dir = tmp_path / job_id
+    job_dir.mkdir()
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_email": "tester@example.com",
+        "requested_stems": 4,
+    }
+    zip_path = job_dir / "stemify_song.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("vocals.wav", b"wav")
+
+    response = client.get(f"/api/download/{job_id}/zip", headers=headers)
+
+    assert response.status_code == 402
+    assert response.json()["detail"]["price_per_stem_cents"] == 300

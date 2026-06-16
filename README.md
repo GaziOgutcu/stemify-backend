@@ -8,7 +8,11 @@ FastAPI backend for uploading an audio file and splitting it into stems with Dem
 - `GET /api/health` - health check for deployments.
 - `POST /api/auth/signup` - create an account with `email` and `password`, returning a bearer token and user stem totals.
 - `POST /api/auth/signin` - sign in with `email` and `password`, returning a bearer token and user stem totals.
+- `GET /api/auth/social/providers` - list social sign-in providers configured for the frontend, such as Google or Apple.
 - `GET /api/me` - return the signed-in user's profile and stem usage totals.
+- `GET /api/payments/config` - return paid-download settings such as price per stem and currency.
+- `POST /api/payments/checkout` - create a Stripe Checkout session for a stem or ZIP download when paid downloads are enabled.
+- `POST /api/payments/confirm` - confirm a Stripe Checkout session before allowing paid downloads.
 - `POST /api/split` - multipart form upload with:
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
   - `stems`: `2`, `4`, or `6` (defaults to `4`)
@@ -17,7 +21,9 @@ FastAPI backend for uploading an audio file and splitting it into stems with Dem
 - `GET /api/download/{job_id}/stem/{filename}` - download one WAV stem.
 - `DELETE /api/cleanup/{job_id}` - remove output files and forget the job.
 
-All split, job status, download, cleanup, and profile endpoints require an `Authorization: Bearer <token>` header from sign up or sign in. Each submitted split job is tied to that signed-in user, and the API increments the user's `jobs_created` and `stem_count` totals when the job is accepted.
+All split, job status, payment checkout/confirm, download, cleanup, and profile endpoints require an `Authorization: Bearer <token>` header from sign up or sign in. Each submitted split job is tied to that signed-in user, and the API increments the user's `jobs_created` and `stem_count` totals when the job is accepted.
+
+Social sign in is not fully automatic from the backend alone. The frontend still needs Google/Apple buttons and provider SDKs, plus production token verification on the backend. `GET /api/auth/social/providers` exposes which providers are configured so the HTML can show or hide those buttons.
 
 ## Local setup
 
@@ -39,6 +45,13 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `DEMUCS_TIMEOUT_SECONDS` | `900` | Maximum processing time per job. |
 | `UPLOAD_DIR` | `uploads` | Temporary upload directory. |
 | `OUTPUT_DIR` | `outputs` | Generated stems directory. |
+| `PAYMENTS_ENABLED` | `false` | Set to `true` to require payment before downloads. |
+| `PRICE_PER_STEM_CENTS` | `300` | Download price per stem in cents; default is `$3.00`. |
+| `PAYMENT_CURRENCY` | `usd` | Currency for Stripe Checkout. |
+| `STRIPE_SECRET_KEY` | empty | Stripe secret key used to create and confirm Checkout sessions. |
+| `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
+| `GOOGLE_CLIENT_ID` | empty | Enables Google as a social sign-in option in `/api/auth/social/providers`. |
+| `APPLE_CLIENT_ID` | empty | Enables Apple as a social sign-in option in `/api/auth/social/providers`. |
 
 ## Frontend integration guide
 
@@ -96,6 +109,32 @@ export async function splitTrack(file: File, token: string, stems = 4) {
     if (job.status === "error") throw new Error(job.error || "Stem split failed");
   }
 }
+
+export async function getSocialProviders() {
+  const response = await fetch(`${API_URL}/api/auth/social/providers`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<{
+    providers: Array<{
+      provider: "google" | "apple";
+      display_name: string;
+      enabled: boolean;
+      client_id: string | null;
+    }>;
+  }>;
+}
+
+export async function createDownloadCheckout(token: string, jobId: string, itemType: "zip" | "stem", filename?: string) {
+  const response = await fetch(`${API_URL}/api/payments/checkout`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ job_id: jobId, item_type: itemType, filename }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<{ checkout_session_id: string; checkout_url: string }>;
+}
 ```
 
 Production checklist for the frontend:
@@ -105,7 +144,10 @@ Production checklist for the frontend:
 3. Disable the upload button while a job is processing.
 4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token.
 5. Show individual stem links and the ZIP link after `status === "done"`.
-6. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
+6. If `PAYMENTS_ENABLED=true`, call `/api/payments/checkout` when the user clicks download and redirect them to the returned `checkout_url`.
+7. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
+
+You can add a Buy Me A Coffee advertisement/promotion directly in the HTML. No backend endpoint is required unless you want the ad placement or copy to be remotely configurable.
 
 ## Deployment notes
 
