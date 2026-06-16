@@ -162,7 +162,7 @@ def test_download_zip_returns_ready_archive(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     job_dir = tmp_path / job_id
     job_dir.mkdir()
-    main.JOBS[job_id] = {"job_id": job_id, "user_email": "tester@example.com"}
+    main.JOBS[job_id] = {"job_id": job_id, "user_email": "tester@example.com", "status": "done"}
     zip_path = job_dir / "stemify_song.zip"
     with zipfile.ZipFile(zip_path, "w") as archive:
         archive.writestr("vocals.wav", b"wav")
@@ -171,6 +171,26 @@ def test_download_zip_returns_ready_archive(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
+
+
+def test_download_zip_reports_not_ready_for_processing_job(tmp_path, monkeypatch):
+    job_id = "processing-zip-test"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    job_dir = tmp_path / job_id
+    job_dir.mkdir()
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_email": "tester@example.com",
+        "status": "processing",
+        "status_detail": "Separating audio with Demucs.",
+        "started_at": 100.0,
+    }
+
+    response = client.get(f"/api/download/{job_id}/zip", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["status"] == "processing"
 
 
 def test_download_zip_requires_payment_when_enabled(tmp_path, monkeypatch):
@@ -183,6 +203,7 @@ def test_download_zip_requires_payment_when_enabled(tmp_path, monkeypatch):
     main.JOBS[job_id] = {
         "job_id": job_id,
         "user_email": "tester@example.com",
+        "status": "done",
         "requested_stems": 4,
     }
     zip_path = job_dir / "stemify_song.zip"

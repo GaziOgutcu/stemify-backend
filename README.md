@@ -23,6 +23,8 @@ FastAPI backend for uploading an audio file and splitting it into stems with Dem
 
 All split, job status, payment checkout/confirm, download, cleanup, and profile endpoints require an `Authorization: Bearer <token>` header from sign up or sign in. Each submitted split job is tied to that signed-in user, and the API increments the user's `jobs_created` and `stem_count` totals when the job is accepted.
 
+Job status responses include `status_detail`, `elapsed_seconds`, and `timeout_seconds` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the job status is `done`.
+
 Social sign in is not fully automatic from the backend alone. The frontend still needs Google/Apple buttons and provider SDKs, plus production token verification on the backend. `GET /api/auth/social/providers` exposes which providers are configured so the HTML can show or hide those buttons.
 
 ## Local setup
@@ -142,7 +144,7 @@ Production checklist for the frontend:
 1. Require sign up/sign in before enabling uploads, then store the returned bearer token securely for API calls.
 2. Validate file extensions and display the backend size limit before upload.
 3. Disable the upload button while a job is processing.
-4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token.
+4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token. Make sure the frontend starts only one polling interval per job and clears it when the job reaches `done` or `error`.
 5. Show individual stem links and the ZIP link after `status === "done"`.
 6. If `PAYMENTS_ENABLED=true`, call `/api/payments/checkout` when the user clicks download and redirect them to the returned `checkout_url`.
 7. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.

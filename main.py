@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,7 +33,7 @@ else:
     except Exception as exc:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
-app = FastAPI(title="Stemify API", version="1.3.0")
+app = FastAPI(title="Stemify API", version="1.3.1")
 
 
 def _split_csv_env(name: str, default: str = "") -> list[str]:
@@ -186,7 +187,17 @@ def current_user(authorization: Annotated[str | None, Header()] = None) -> dict[
 def update_job(job_id: str, **values: Any) -> None:
     with JOBS_LOCK:
         if job_id in JOBS:
+            values.setdefault("updated_at", time.time())
             JOBS[job_id].update(values)
+
+
+def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
+    public_job = job.copy()
+    started_at = public_job.get("started_at")
+    if started_at:
+        public_job["elapsed_seconds"] = round(time.time() - float(started_at), 1)
+    public_job["timeout_seconds"] = DEMUCS_TIMEOUT_SECONDS
+    return public_job
 
 
 def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
@@ -196,7 +207,7 @@ def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(404, "Job not found")
         if job.get("user_email") != user["email"]:
             raise HTTPException(404, "Job not found")
-        return job.copy()
+        return serialize_job(job)
 
 
 def payment_key(job_id: str, item_type: str, filename: str | None = None) -> str:
@@ -234,6 +245,22 @@ def enforce_paid_download(job: dict[str, Any], user: dict[str, Any], item_type: 
             "price_per_stem_cents": PRICE_PER_STEM_CENTS,
             "currency": PAYMENT_CURRENCY,
             "checkout_endpoint": "/api/payments/checkout",
+        },
+    )
+
+
+def enforce_job_done(job: dict[str, Any]) -> None:
+    if job.get("status") == "done":
+        return
+
+    raise HTTPException(
+        409,
+        {
+            "message": "Stems are not ready yet.",
+            "status": job.get("status"),
+            "status_detail": job.get("status_detail"),
+            "elapsed_seconds": job.get("elapsed_seconds"),
+            "timeout_seconds": job.get("timeout_seconds"),
         },
     )
 
@@ -366,6 +393,7 @@ async def create_checkout_session(
         raise HTTPException(400, "Payments are disabled.")
 
     job = get_authorized_job(payload.job_id, user)
+    enforce_job_done(job)
     filename = payload.filename if payload.item_type == "stem" else None
     if payload.item_type == "stem" and not filename:
         raise HTTPException(400, "A stem filename is required for stem checkout.")
@@ -458,11 +486,13 @@ async def split_audio(
     safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(original_name).stem)[:80] or "track"
     input_path = UPLOAD_DIR / f"{job_id}{suffix}"
     input_path.write_bytes(contents)
+    now = time.time()
 
     with JOBS_LOCK:
         JOBS[job_id] = {
             "job_id": job_id,
             "status": "processing",
+            "status_detail": "Queued for stem separation.",
             "stems": [],
             "zip_url": None,
             "stem_urls": {},
@@ -470,6 +500,8 @@ async def split_audio(
             "track_name": safe_stem,
             "user_email": user["email"],
             "requested_stems": stems,
+            "started_at": now,
+            "updated_at": now,
         }
     with AUTH_LOCK:
         user["jobs_created"] += 1
@@ -486,6 +518,7 @@ async def split_audio(
         {
             "job_id": job_id,
             "status": "processing",
+            "status_detail": "Queued for stem separation.",
             "track_name": safe_stem,
             "user": public_user(user),
         }
@@ -500,6 +533,7 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
             cmd += ["--two-stems", "vocals"]
         cmd.append(str(input_path))
 
+        update_job(job_id, status_detail="Separating audio with Demucs. First runs can be slower while the model warms up.")
         print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DEMUCS_TIMEOUT_SECONDS)
         print(f"[JOB {job_id[:8]}] STDOUT:\n{proc.stdout[-2000:]}", flush=True)
@@ -509,12 +543,18 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
         if proc.returncode != 0:
             err = (proc.stderr or "") + (proc.stdout or "")
             print(f"[JOB {job_id[:8]}] FAILED:\n{err[-800:]}")
-            update_job(job_id, status="error", error=f"Demucs error: {err[-400:]}")
+            update_job(job_id, status="error", status_detail="Stem separation failed.", error=f"Demucs error: {err[-400:]}")
             return
 
+        update_job(job_id, status_detail="Finalizing stem files and ZIP download.")
         wavs = sorted(job_dir.rglob("*.wav"))
         if not wavs:
-            update_job(job_id, status="error", error="No output files produced.")
+            update_job(
+                job_id,
+                status="error",
+                status_detail="Stem separation finished without producing WAV files.",
+                error="No output files produced.",
+            )
             return
 
         zip_path = job_dir / f"stemify_{track_name}.zip"
@@ -527,6 +567,7 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
         update_job(
             job_id,
             status="done",
+            status_detail="Stems are ready to download.",
             stems=stem_names,
             zip_url=f"/api/download/{job_id}/zip",
             stem_urls=stem_urls,
@@ -534,9 +575,14 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
         print(f"[JOB {job_id[:8]}] Done: {stem_names}")
 
     except subprocess.TimeoutExpired:
-        update_job(job_id, status="error", error="Timed out. Try a shorter track.")
+        update_job(
+            job_id,
+            status="error",
+            status_detail="Stem separation timed out.",
+            error=f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds. Try a shorter track.",
+        )
     except Exception as exc:
-        update_job(job_id, status="error", error=str(exc))
+        update_job(job_id, status="error", status_detail="Stem separation crashed.", error=str(exc))
         print(f"[JOB {job_id[:8]}] Exception: {exc}")
     finally:
         input_path.unlink(missing_ok=True)
@@ -550,6 +596,7 @@ async def job_status(job_id: str, user: Annotated[dict[str, Any], Depends(curren
 @app.get("/api/download/{job_id}/zip")
 async def download_zip(job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
     job = get_authorized_job(job_id, user)
+    enforce_job_done(job)
     enforce_paid_download(job, user, "zip")
     job_dir = OUTPUT_DIR / job_id
     if not job_dir.is_dir():
@@ -570,6 +617,7 @@ async def download_stem(
         raise HTTPException(400, "Invalid stem filename.")
 
     job = get_authorized_job(job_id, user)
+    enforce_job_done(job)
     enforce_paid_download(job, user, "stem", filename)
     job_dir = OUTPUT_DIR / job_id
     if not job_dir.is_dir():
