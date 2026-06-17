@@ -10,7 +10,7 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
 - `GET /api/payments/config` - return paid-download settings such as price per song and currency.
 - `POST /api/create-checkout-session` - frontend-safe endpoint that creates a Stripe Checkout Session from the FastAPI backend when paid downloads are enabled.
 - `POST /api/stripe/webhook` - Stripe webhook endpoint that confirms successful payment before downloads are unlocked.
-- `POST /api/payments/confirm` - return local payment status after the webhook has run; it does not confirm payment itself.
+- `POST /api/payments/confirm` - verify a Stripe Checkout Session with Stripe using the backend secret key and return whether the signed-in user has paid.
 - `POST /api/split` - multipart form upload with:
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
   - `stems`: always `2` for vocals and instrumental
@@ -42,17 +42,21 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `ALLOWED_ORIGINS` | `*` | Comma-separated frontend origins. Set this to your Vercel/local frontend URLs in production. |
 | `MAX_FILE_SIZE_MB` | `50` | Upload size limit. |
 | `DEMUCS_TIMEOUT_SECONDS` | `900` | Maximum processing time per job. |
+| `DEMUCS_MODEL` | `mdx_q` | Demucs model used for 2-stem vocal/instrumental previews. `mdx_q` is much faster on CPU than `htdemucs`; set `htdemucs` only if quality matters more than speed. |
 | `DEMUCS_SHIFTS` | `0` | Demucs test-time shifts. `0` is fastest; raise only if you prefer quality over speed. |
 | `DEMUCS_OVERLAP` | `0.1` | Demucs split overlap. Lower values are faster. |
-| `DEMUCS_JOBS` | `0` | Optional Demucs worker count; `0` leaves the default behavior. |
+| `DEMUCS_SEGMENT_SECONDS` | `8` | Smaller Demucs processing chunks reduce memory pressure and usually improve CPU stability on small Railway containers. |
+| `DEMUCS_JOBS` | `0` | Optional Demucs worker count; keep `0` for one preview at a time unless you have spare CPU/RAM. |
 | `DEMUCS_DEVICE` | empty | Optional Demucs device override such as `cuda` or `cpu`. |
+| `DEMUCS_CPU_THREADS` | `2` | CPU threads exposed to Torch/BLAS in the Demucs subprocess. Tune to your Railway CPU allocation. |
+| `DEMUCS_CONCURRENCY` | `1` | Maximum concurrent Demucs subprocesses. Keep at `1` on CPU Railway deployments to avoid multiple jobs slowing each other down or exhausting memory. |
 | `UPLOAD_DIR` | `uploads` | Temporary upload directory. |
 | `OUTPUT_DIR` | `outputs` | Generated stems directory. |
 | `PREVIEW_DURATION_SECONDS` | `15` | Free preview length to split into vocals and instrumental. |
-| `PAYMENTS_ENABLED` | `false` | Set to `true` to require payment before downloads. |
+| `PAYMENTS_ENABLED` | `true` when `STRIPE_SECRET_KEY` is present, otherwise `false` | Explicit feature flag for paid downloads and Checkout. Set to `true` in production, or leave unset when `STRIPE_SECRET_KEY` is configured. |
 | `PRICE_PER_SONG_CENTS` | `300` | Full-song download price in cents; default is `$3.00`. |
 | `PAYMENT_CURRENCY` | `usd` | Currency for Stripe Checkout. |
-| `STRIPE_SECRET_KEY` | empty | Stripe secret key used only by the FastAPI backend on Railway to create Checkout Sessions. Never expose this in frontend code or `index.html`. |
+| `STRIPE_SECRET_KEY` | empty | Stripe secret key used only by the FastAPI backend on Railway to create Checkout Sessions. If present and `PAYMENTS_ENABLED` is unset, paid downloads are enabled automatically. Never expose this in frontend code or `index.html`. |
 | `STRIPE_WEBHOOK_SECRET` | empty | Stripe webhook signing secret used by `/api/stripe/webhook` to verify Stripe events before unlocking downloads. |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
 | `FIREBASE_PROJECT_ID` | empty | Firebase project ID used by Firebase Admin SDK. |
@@ -127,10 +131,12 @@ Production checklist for the frontend:
 5. Show the 15-second vocal/instrumental preview after `status === "done"`.
 6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) before uploading; send it as `output_format`.
 7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
-8. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; downloads remain locked until that webhook verifies a successful paid session.
-9. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
+8. For a static Vercel `index.html`, Stripe redirects back to `/?payment=success&session_id={CHECKOUT_SESSION_ID}` or `/?payment=cancelled`; parse those query params in `index.html`, but never unlock downloads from query params alone.
+9. When `payment=success`, call `POST /api/payments/confirm` with the bearer token and `{ "checkout_session_id": sessionId }`; the backend retrieves the Checkout Session from Stripe and only returns `paid` when Stripe says it is paid.
+10. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; webhook confirmation is still accepted, and backend Stripe API verification covers the immediate post-checkout redirect path.
+11. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
 
-The simple product is: free 15-second vocal/instrumental preview, then a safe Stripe-hosted $3 per song checkout for the full download. The browser only asks the backend to create checkout; the backend creates the Checkout Session and the Stripe webhook is the source of truth for unlocking downloads.
+The simple product is: free 15-second vocal/instrumental preview, then a safe Stripe-hosted $3 per song checkout for the full download. The browser only asks the backend to create checkout and verify a returned session ID; the backend creates the Checkout Session, verifies session ownership/status with Stripe, and also accepts verified Stripe webhooks for unlocking downloads.
 
 ## Deployment notes
 
@@ -140,4 +146,4 @@ The included Dockerfile installs FFmpeg and Demucs. Railway should use `railway.
 ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
 ```
 
-For speed, the backend now runs Demucs with no test-time shifts by default and low overlap; set `DEMUCS_DEVICE=cuda` on GPU infrastructure for much faster processing. Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
+For speed, the backend now runs the quantized `mdx_q` Demucs model, no test-time shifts, low overlap, bounded segment size, one Demucs worker at a time, and explicit Torch/BLAS CPU thread limits by default. Set `DEMUCS_DEVICE=cuda` on GPU infrastructure for much faster processing, or set `DEMUCS_MODEL=htdemucs` if quality matters more than CPU speed. Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
