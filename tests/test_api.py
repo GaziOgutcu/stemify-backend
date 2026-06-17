@@ -44,6 +44,25 @@ def auth_headers(uid="test-uid", email="tester@example.com", name="Test User"):
     return {"Authorization": f"Bearer {token}"}
 
 
+@pytest.fixture(autouse=True)
+def reset_auth_state():
+    main.USERS.clear()
+    main.TOKENS.clear()
+    main.JOBS.clear()
+    main.PAYMENTS.clear()
+    yield
+    main.USERS.clear()
+    main.TOKENS.clear()
+    main.JOBS.clear()
+    main.PAYMENTS.clear()
+
+
+def auth_headers(email="tester@example.com", password="password123"):
+    response = client.post("/api/auth/signup", json={"email": email, "password": password})
+    assert response.status_code == 200
+    return {"Authorization": f"Bearer {response.json()['token']}"}
+
+
 def test_health_includes_runtime_details():
     response = client.get("/api/health")
 

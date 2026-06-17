@@ -2,6 +2,7 @@ import json
 import importlib.util
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from hashlib import pbkdf2_hmac
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -108,6 +110,97 @@ STEM_MODELS = {
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 SAFE_DOWNLOAD_RE = re.compile(r"^[A-Za-z0-9_. -]+\.wav$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Simple in-memory auth store. This keeps the current deployment lightweight,
+# while making every split job attributable to a signed-in user. Move these
+# dictionaries to a database before scaling beyond one backend instance.
+USERS: dict[str, dict[str, Any]] = {}
+TOKENS: dict[str, str] = {}
+AUTH_LOCK = threading.Lock()
+PASSWORD_ITERATIONS = 390_000
+PAYMENTS: dict[str, dict[str, Any]] = {}
+PAYMENTS_LOCK = threading.Lock()
+
+
+class AuthRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class UserProfile(BaseModel):
+    email: str
+    stem_count: int
+    jobs_created: int
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserProfile
+
+
+class CheckoutRequest(BaseModel):
+    job_id: str
+    item_type: str = Field(default="song", pattern="^(song|zip|stem)$")
+    filename: str | None = Field(default=None, max_length=120)
+
+
+class ConfirmPaymentRequest(BaseModel):
+    checkout_session_id: str
+
+
+def normalize_email(email: str) -> str:
+    normalized = email.strip().lower()
+    if not EMAIL_RE.fullmatch(normalized):
+        raise HTTPException(400, "Enter a valid email address.")
+    return normalized
+
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        actual = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+        return secrets.compare_digest(actual, expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def public_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "email": user["email"],
+        "stem_count": user["stem_count"],
+        "jobs_created": user["jobs_created"],
+    }
+
+
+def create_auth_response(user: dict[str, Any]) -> AuthResponse:
+    token = secrets.token_urlsafe(32)
+    with AUTH_LOCK:
+        TOKENS[token] = user["email"]
+    return AuthResponse(token=token, user=UserProfile(**public_user(user)))
+
+
+def current_user(authorization: Annotated[str | None, Header()] = None) -> dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Authentication required.")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    with AUTH_LOCK:
+        email = TOKENS.get(token)
+        user = USERS.get(email or "")
+    if not user:
+        raise HTTPException(401, "Invalid or expired token.")
+    return user
 
 # Simple in-memory user/job stores. Firebase verifies identity; these dicts only
 # keep lightweight per-user usage counts for the current single-instance API.
