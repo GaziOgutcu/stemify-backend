@@ -150,7 +150,7 @@ PAYMENTS_ENABLED = (
     os.getenv("PAYMENTS_ENABLED", "true" if STRIPE_SECRET_KEY else "false").lower()
     == "true"
 )
-PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "usd").lower()
+PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "aud").lower()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
@@ -173,6 +173,7 @@ SAFE_DOWNLOAD_RE = re.compile(r"^[A-Za-z0-9_. -]+\.(wav|mp3|flac|ogg|m4a)$")
 USERS: dict[str, dict[str, Any]] = {}
 AUTH_LOCK = threading.Lock()
 PAYMENTS: dict[str, dict[str, Any]] = {}
+USER_PAYMENT_JOBS: dict[str, set[str]] = {}
 PAYMENTS_LOCK = threading.Lock()
 
 
@@ -191,6 +192,7 @@ class CheckoutRequest(BaseModel):
 
 class PaymentStatusRequest(BaseModel):
     checkout_session_id: str
+    job_id: str | None = None
 
 
 def initialize_firebase() -> None:
@@ -463,12 +465,17 @@ def json_loads(raw: bytes) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
-def checkout_success_url() -> str:
-    return f"{FRONTEND_URL}/?payment=success&session_id={{CHECKOUT_SESSION_ID}}"
+def checkout_success_url(job_id: str) -> str:
+    encoded_job_id = urllib.parse.quote(job_id, safe="")
+    return (
+        f"{FRONTEND_URL}/?payment=success"
+        f"&session_id={{CHECKOUT_SESSION_ID}}&job_id={encoded_job_id}"
+    )
 
 
-def checkout_cancel_url() -> str:
-    return f"{FRONTEND_URL}/?payment=cancelled"
+def checkout_cancel_url(job_id: str) -> str:
+    encoded_job_id = urllib.parse.quote(job_id, safe="")
+    return f"{FRONTEND_URL}/?payment=cancelled&job_id={encoded_job_id}"
 
 
 def retrieve_checkout_session(checkout_session_id: str) -> dict[str, Any]:
@@ -622,8 +629,8 @@ async def create_checkout_session(
         amount_cents,
         PAYMENT_CURRENCY,
         stripe_key_mode(),
-        checkout_success_url(),
-        checkout_cancel_url(),
+        checkout_success_url(payload.job_id),
+        checkout_cancel_url(payload.job_id),
     )
     session = stripe_request(
         "POST",
@@ -631,8 +638,8 @@ async def create_checkout_session(
         {
             "mode": "payment",
             "customer_email": user["email"],
-            "success_url": checkout_success_url(),
-            "cancel_url": checkout_cancel_url(),
+            "success_url": checkout_success_url(payload.job_id),
+            "cancel_url": checkout_cancel_url(payload.job_id),
             "line_items[0][quantity]": "1",
             "line_items[0][price_data][currency]": PAYMENT_CURRENCY,
             "line_items[0][price_data][unit_amount]": str(amount_cents),
@@ -658,6 +665,7 @@ async def create_checkout_session(
             "amount_cents": amount_cents,
             "currency": PAYMENT_CURRENCY,
         }
+        USER_PAYMENT_JOBS.setdefault(user["uid"], set()).add(payload.job_id)
 
     return {"checkout_session_id": session["id"], "checkout_url": session.get("url")}
 
@@ -728,60 +736,80 @@ def mark_checkout_session_paid(
             payment["stripe_event_confirmed"] = True
         if verification_source == "api":
             payment["stripe_api_verified"] = True
+        USER_PAYMENT_JOBS.setdefault(user_uid, set()).add(job_id)
+    with JOBS_LOCK:
+        if job_id in JOBS and JOBS[job_id].get("user_uid") == user_uid:
+            JOBS[job_id].update(
+                {
+                    "paid": True,
+                    "payment_status": "paid",
+                    "paid_checkout_session_id": session_id,
+                    "updated_at": time.time(),
+                }
+            )
         return payment.copy()
 
 
-@app.post("/api/stripe/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    verify_stripe_webhook_signature(payload, request.headers.get("stripe-signature"))
+def payment_verification_response(
+    payment: dict[str, Any], user: dict[str, Any]
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "status": payment.get("status", "pending"),
+        "stripe_payment_status": payment.get("stripe_payment_status"),
+        "job_id": payment["job_id"],
+        "item_type": payment.get("item_type", "song"),
+        "payment_status": payment.get("status", "pending"),
+    }
+    if payment.get("status") == "paid":
+        job = get_authorized_job(payment["job_id"], user)
+        response.update(
+            {
+                "zip_url": job.get("zip_url"),
+                "stem_urls": job.get("stem_urls", {}),
+                "download_urls": {
+                    "zip": job.get("zip_url"),
+                    "stems": job.get("stem_urls", {}),
+                },
+            }
+        )
+    return response
 
-    try:
-        event = json.loads(payload.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(400, "Invalid Stripe webhook payload.") from exc
 
-    if event.get("type") == "checkout.session.completed":
-        session = (event.get("data") or {}).get("object") or {}
-        if session.get("payment_status") == "paid":
-            payment = mark_checkout_session_paid(session)
-            return {"received": True, "status": "paid", "job_id": payment["job_id"]}
-
-    return {"received": True}
-
-
-@app.post("/api/payments/confirm")
-async def payment_status(
-    payload: PaymentStatusRequest,
-    user: Annotated[dict[str, Any], Depends(current_user)],
-):
+def verify_checkout_payment(
+    checkout_session_id: str, job_id: str | None, user: dict[str, Any]
+) -> dict[str, Any]:
     validate_checkout_configuration()
 
     with PAYMENTS_LOCK:
-        payment = PAYMENTS.get(payload.checkout_session_id)
+        payment = PAYMENTS.get(checkout_session_id)
 
     if payment and payment.get("user_uid") != user["uid"]:
         raise HTTPException(404, "Payment not found.")
+    if payment and job_id and payment.get("job_id") != job_id:
+        raise HTTPException(400, "Checkout Session does not belong to this job.")
 
-    session = retrieve_checkout_session(payload.checkout_session_id)
+    session = retrieve_checkout_session(checkout_session_id)
     metadata = session.get("metadata") or {}
+    session_job_id = metadata.get("job_id")
     if metadata.get("user_uid") != user["uid"]:
         raise HTTPException(404, "Payment not found.")
+    if job_id and session_job_id != job_id:
+        raise HTTPException(400, "Checkout Session does not belong to this job.")
 
     if session.get("payment_status") == "paid":
         payment = mark_checkout_session_paid(session, verification_source="api")
     elif not payment:
         with PAYMENTS_LOCK:
             payment = PAYMENTS.setdefault(
-                payload.checkout_session_id,
+                checkout_session_id,
                 {
-                    "checkout_session_id": payload.checkout_session_id,
+                    "checkout_session_id": checkout_session_id,
                     "payment_key": payment_key(
-                        metadata.get("job_id", ""),
+                        session_job_id or "",
                         metadata.get("item_type", "song"),
                         metadata.get("filename") or None,
                     ),
-                    "job_id": metadata.get("job_id"),
+                    "job_id": session_job_id,
                     "item_type": metadata.get("item_type", "song"),
                     "filename": metadata.get("filename") or None,
                     "user_uid": user["uid"],
@@ -803,12 +831,45 @@ async def payment_status(
             )
             payment = payment.copy()
 
-    return {
-        "status": payment.get("status", "pending"),
-        "stripe_payment_status": payment.get("stripe_payment_status"),
-        "job_id": payment["job_id"],
-        "item_type": payment["item_type"],
-    }
+    if not payment.get("job_id"):
+        raise HTTPException(400, "Stripe session metadata is missing job_id.")
+    return payment_verification_response(payment, user)
+
+
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    verify_stripe_webhook_signature(payload, request.headers.get("stripe-signature"))
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "Invalid Stripe webhook payload.") from exc
+
+    if event.get("type") == "checkout.session.completed":
+        session = (event.get("data") or {}).get("object") or {}
+        if session.get("payment_status") == "paid":
+            payment = mark_checkout_session_paid(session)
+            return {"received": True, "status": "paid", "job_id": payment["job_id"]}
+
+    return {"received": True}
+
+
+@app.get("/api/payment/verify")
+async def verify_payment(
+    session_id: str,
+    job_id: str,
+    user: Annotated[dict[str, Any], Depends(current_user)],
+):
+    return verify_checkout_payment(session_id, job_id, user)
+
+
+@app.post("/api/payments/confirm")
+async def payment_status(
+    payload: PaymentStatusRequest,
+    user: Annotated[dict[str, Any], Depends(current_user)],
+):
+    return verify_checkout_payment(payload.checkout_session_id, payload.job_id, user)
 
 
 @app.post("/api/split")
@@ -870,6 +931,8 @@ async def split_audio(
             "output_format": output_format,
             "started_at": now,
             "updated_at": now,
+            "payment_status": "pending",
+            "paid": False,
         }
     with AUTH_LOCK:
         user["jobs_created"] += 1

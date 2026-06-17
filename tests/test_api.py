@@ -19,6 +19,7 @@ def reset_auth_state(monkeypatch):
     main.USERS.clear()
     main.JOBS.clear()
     main.PAYMENTS.clear()
+    main.USER_PAYMENT_JOBS.clear()
     FIREBASE_TOKENS.clear()
 
     main.firebase_admin._apps["test"] = object()
@@ -33,6 +34,7 @@ def reset_auth_state(monkeypatch):
     main.USERS.clear()
     main.JOBS.clear()
     main.PAYMENTS.clear()
+    main.USER_PAYMENT_JOBS.clear()
     FIREBASE_TOKENS.clear()
     main.firebase_admin._apps.pop("test", None)
 
@@ -135,11 +137,14 @@ def test_create_checkout_session_uses_legacy_payments_endpoint(monkeypatch):
     def fake_stripe_request(method, path, data=None):
         assert (
             data["success_url"]
-            == "http://localhost:3000/?payment=success&session_id={CHECKOUT_SESSION_ID}"
+            == "http://localhost:3000/?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=checkout-legacy-job"
         )
-        assert data["cancel_url"] == "http://localhost:3000/?payment=cancelled"
+        assert (
+            data["cancel_url"]
+            == "http://localhost:3000/?payment=cancelled&job_id=checkout-legacy-job"
+        )
         assert data["line_items[0][price_data][unit_amount]"] == "300"
-        assert data["line_items[0][price_data][currency]"] == "usd"
+        assert data["line_items[0][price_data][currency]"] == "aud"
         return {"id": "cs_live_123", "url": "https://checkout.stripe.com/session"}
 
     monkeypatch.setattr(main, "stripe_request", fake_stripe_request)
@@ -170,9 +175,12 @@ def test_checkout_uses_static_frontend_root_redirects(monkeypatch):
     def fake_stripe_request(method, path, data=None):
         assert (
             data["success_url"]
-            == "https://vocalsplitter.app/?payment=success&session_id={CHECKOUT_SESSION_ID}"
+            == "https://vocalsplitter.app/?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=checkout-static-frontend-job"
         )
-        assert data["cancel_url"] == "https://vocalsplitter.app/?payment=cancelled"
+        assert (
+            data["cancel_url"]
+            == "https://vocalsplitter.app/?payment=cancelled&job_id=checkout-static-frontend-job"
+        )
         return {"id": "cs_live_static", "url": "https://checkout.stripe.com/session"}
 
     monkeypatch.setattr(main, "stripe_request", fake_stripe_request)
@@ -281,6 +289,13 @@ def test_payment_status_marks_paid_from_stripe_api(monkeypatch):
     headers = auth_headers()
     monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
     monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_test_backend_only")
+    main.JOBS["job-id"] = {
+        "job_id": "job-id",
+        "user_uid": "test-uid",
+        "status": "done",
+        "zip_url": "/api/download/job-id/zip",
+        "stem_urls": {},
+    }
 
     def fake_retrieve_checkout_session(checkout_session_id):
         assert checkout_session_id == "cs_paid_by_api"
@@ -312,6 +327,82 @@ def test_payment_status_marks_paid_from_stripe_api(monkeypatch):
     assert response.json()["status"] == "paid"
     assert main.PAYMENTS["cs_paid_by_api"]["status"] == "paid"
     assert main.PAYMENTS["cs_paid_by_api"]["stripe_api_verified"] is True
+
+
+def test_payment_verify_get_marks_job_paid_and_returns_download_urls(monkeypatch):
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_test_backend_only")
+    job_id = "verify-paid-job"
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "zip_url": f"/api/download/{job_id}/zip",
+        "stem_urls": {"vocals": f"/api/download/{job_id}/stem/vocals.wav"},
+    }
+
+    def fake_retrieve_checkout_session(checkout_session_id):
+        assert checkout_session_id == "cs_verify_paid"
+        return {
+            "id": "cs_verify_paid",
+            "payment_status": "paid",
+            "amount_total": 300,
+            "currency": "aud",
+            "customer_email": "tester@example.com",
+            "metadata": {
+                "job_id": job_id,
+                "item_type": "song",
+                "user_uid": "test-uid",
+                "user_email": "tester@example.com",
+            },
+        }
+
+    monkeypatch.setattr(
+        main, "retrieve_checkout_session", fake_retrieve_checkout_session
+    )
+
+    response = client.get(
+        f"/api/payment/verify?session_id=cs_verify_paid&job_id={job_id}",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "paid"
+    assert payload["payment_status"] == "paid"
+    assert payload["download_urls"]["zip"] == f"/api/download/{job_id}/zip"
+    assert main.JOBS[job_id]["paid"] is True
+    assert main.JOBS[job_id]["payment_status"] == "paid"
+
+
+def test_payment_verify_rejects_mismatched_job_id(monkeypatch):
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_test_backend_only")
+
+    def fake_retrieve_checkout_session(checkout_session_id):
+        return {
+            "id": checkout_session_id,
+            "payment_status": "paid",
+            "metadata": {
+                "job_id": "real-job",
+                "item_type": "song",
+                "user_uid": "test-uid",
+            },
+        }
+
+    monkeypatch.setattr(
+        main, "retrieve_checkout_session", fake_retrieve_checkout_session
+    )
+
+    response = client.get(
+        "/api/payment/verify?session_id=cs_mismatch&job_id=query-job",
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Checkout Session does not belong to this job."
 
 
 def test_stripe_webhook_marks_payment_paid(monkeypatch):
