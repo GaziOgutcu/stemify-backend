@@ -1,10 +1,13 @@
+import hmac
+import json
+import time
+from hashlib import sha256
 import threading
 import zipfile
 
 import main
 import pytest
 from fastapi.testclient import TestClient
-
 
 client = TestClient(main.app)
 FIREBASE_TOKENS = {}
@@ -44,23 +47,11 @@ def auth_headers(uid="test-uid", email="tester@example.com", name="Test User"):
     return {"Authorization": f"Bearer {token}"}
 
 
-@pytest.fixture(autouse=True)
-def reset_auth_state():
-    main.USERS.clear()
-    main.TOKENS.clear()
-    main.JOBS.clear()
-    main.PAYMENTS.clear()
-    yield
-    main.USERS.clear()
-    main.TOKENS.clear()
-    main.JOBS.clear()
-    main.PAYMENTS.clear()
-
-
-def auth_headers(email="tester@example.com", password="password123"):
-    response = client.post("/api/auth/signup", json={"email": email, "password": password})
-    assert response.status_code == 200
-    return {"Authorization": f"Bearer {response.json()['token']}"}
+def stripe_signature(payload: bytes, secret: str) -> str:
+    timestamp = str(int(time.time()))
+    signed_payload = timestamp.encode("utf-8") + b"." + payload
+    signature = hmac.new(secret.encode("utf-8"), signed_payload, sha256).hexdigest()
+    return f"t={timestamp},v1={signature}"
 
 
 def test_health_includes_runtime_details():
@@ -72,6 +63,7 @@ def test_health_includes_runtime_details():
     assert "ffmpeg_available" in payload
     assert "upload_dir" in payload
     assert "output_dir" in payload
+    assert "mp3" in payload["output_formats"]
 
 
 def test_me_returns_firebase_user_profile():
@@ -92,6 +84,103 @@ def test_payments_config_defaults_to_disabled():
     assert response.status_code == 200
     assert response.json()["enabled"] is False
     assert response.json()["price_per_song_cents"] == 300
+    assert response.json()["checkout_endpoint"] == "/api/create-checkout-session"
+
+
+def test_create_checkout_session_available_on_frontend_endpoint(monkeypatch):
+    job_id = "checkout-job"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_test_backend_only")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "requested_stems": 2,
+    }
+
+    def fake_stripe_request(method, path, data=None):
+        assert method == "POST"
+        assert path == "/checkout/sessions"
+        assert data["metadata[job_id]"] == job_id
+        assert data["metadata[user_uid]"] == "test-uid"
+        return {"id": "cs_test_123", "url": "https://checkout.stripe.test/session"}
+
+    monkeypatch.setattr(main, "stripe_request", fake_stripe_request)
+
+    response = client.post(
+        "/api/create-checkout-session",
+        json={"job_id": job_id, "item_type": "song"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["checkout_session_id"] == "cs_test_123"
+    assert main.PAYMENTS["cs_test_123"]["status"] == "pending"
+
+
+def test_payment_status_does_not_confirm_without_webhook(monkeypatch):
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    main.PAYMENTS["cs_pending"] = {
+        "checkout_session_id": "cs_pending",
+        "payment_key": main.payment_key("job-id", "song"),
+        "job_id": "job-id",
+        "item_type": "song",
+        "filename": None,
+        "user_uid": "test-uid",
+        "status": "pending",
+    }
+
+    response = client.post(
+        "/api/payments/confirm",
+        json={"checkout_session_id": "cs_pending"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending"
+    assert main.PAYMENTS["cs_pending"]["status"] == "pending"
+
+
+def test_stripe_webhook_marks_payment_paid(monkeypatch):
+    secret = "whsec_test"
+    monkeypatch.setattr(main, "STRIPE_WEBHOOK_SECRET", secret)
+    main.PAYMENTS["cs_paid"] = {
+        "checkout_session_id": "cs_paid",
+        "payment_key": main.payment_key("job-id", "song"),
+        "job_id": "job-id",
+        "item_type": "song",
+        "filename": None,
+        "user_uid": "test-uid",
+        "status": "pending",
+    }
+    payload = json.dumps(
+        {
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": "cs_paid",
+                    "payment_status": "paid",
+                    "metadata": {
+                        "job_id": "job-id",
+                        "item_type": "song",
+                        "user_uid": "test-uid",
+                    },
+                }
+            },
+        }
+    ).encode("utf-8")
+
+    response = client.post(
+        "/api/stripe/webhook",
+        content=payload,
+        headers={"stripe-signature": stripe_signature(payload, secret)},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "paid"
+    assert main.PAYMENTS["cs_paid"]["status"] == "paid"
 
 
 def test_split_requires_authentication():
@@ -129,6 +218,18 @@ def test_split_rejects_unsupported_file_type():
     assert "Unsupported file type" in response.json()["detail"]
 
 
+def test_split_rejects_unsupported_output_format():
+    response = client.post(
+        "/api/split",
+        files={"file": ("song.mp3", b"audio", "audio/mpeg")},
+        data={"stems": "2", "output_format": "exe"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert "Unsupported output format" in response.json()["detail"]
+
+
 def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     def fake_thread(*, target, args, daemon):
         class DummyThread:
@@ -142,7 +243,7 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     response = client.post(
         "/api/split",
         files={"file": ("My Song!!!.mp3", b"audio", "audio/mpeg")},
-        data={"stems": "2"},
+        data={"stems": "2", "output_format": "mp3"},
         headers=headers,
     )
 
@@ -151,6 +252,8 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     assert payload["status"] == "processing"
     assert payload["track_name"] == "My_Song___"
     assert payload["preview_duration_seconds"] == 15
+    assert payload["output_format"] == "mp3"
+    assert "wav" in payload["available_output_formats"]
     assert payload["user"]["stem_count"] == 2
     assert payload["user"]["jobs_created"] == 1
     assert payload["job_id"] in main.JOBS
@@ -158,7 +261,9 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
 
 
 def test_download_stem_rejects_invalid_filename():
-    response = client.get("/api/download/example/stem/..%2Fsecret.wav", headers=auth_headers())
+    response = client.get(
+        "/api/download/example/stem/..%2Fsecret.wav", headers=auth_headers()
+    )
 
     assert response.status_code in {400, 404}
 
@@ -221,3 +326,36 @@ def test_download_zip_requires_payment_when_enabled(tmp_path, monkeypatch):
 
     assert response.status_code == 402
     assert response.json()["detail"]["price_per_song_cents"] == 300
+
+
+def test_download_zip_allowed_after_webhook_confirms_payment(tmp_path, monkeypatch):
+    job_id = "webhook-paid-zip-test"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    job_dir = tmp_path / job_id
+    job_dir.mkdir()
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "requested_stems": 2,
+    }
+    main.PAYMENTS["cs_paid"] = {
+        "checkout_session_id": "cs_paid",
+        "payment_key": main.payment_key(job_id, "zip"),
+        "job_id": job_id,
+        "item_type": "zip",
+        "filename": None,
+        "user_uid": "test-uid",
+        "status": "paid",
+        "stripe_event_confirmed": True,
+    }
+    zip_path = job_dir / "stemify_song.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("vocals.wav", b"wav")
+
+    response = client.get(f"/api/download/{job_id}/zip", headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"

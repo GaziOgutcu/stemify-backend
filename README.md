@@ -1,6 +1,6 @@
 # Stemify Backend
 
-FastAPI backend for uploading an audio file and splitting a 15-second preview into vocals and instrumental with Demucs.
+FastAPI backend for uploading an audio file and splitting a 15-second preview into vocals and instrumental with Demucs, with optional Stripe Checkout for a safe $3 full-song download flow.
 
 ## API endpoints
 
@@ -8,19 +8,21 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
 - `GET /api/health` - health check for deployments.
 - `GET /api/me` - return the signed-in Firebase user's `uid`, `email`, `name`, and `provider`.
 - `GET /api/payments/config` - return paid-download settings such as price per song and currency.
-- `POST /api/payments/checkout` - create a Stripe Checkout session for a full-song download when paid downloads are enabled.
-- `POST /api/payments/confirm` - confirm a Stripe Checkout session before allowing paid downloads.
+- `POST /api/create-checkout-session` - frontend-safe endpoint that creates a Stripe Checkout Session from the FastAPI backend when paid downloads are enabled.
+- `POST /api/stripe/webhook` - Stripe webhook endpoint that confirms successful payment before downloads are unlocked.
+- `POST /api/payments/confirm` - return local payment status after the webhook has run; it does not confirm payment itself.
 - `POST /api/split` - multipart form upload with:
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
   - `stems`: always `2` for vocals and instrumental
+  - `output_format`: optional `wav`, `mp3`, `flac`, `ogg`, or `m4a` for the generated download files; defaults to `wav`
 - `GET /api/job/{job_id}` - poll job status until it is `done` or `error`.
 - `GET /api/download/{job_id}/zip` - download all produced stems as a ZIP.
-- `GET /api/download/{job_id}/stem/{filename}` - download one WAV stem.
+- `GET /api/download/{job_id}/stem/{filename}` - download one stem in the requested output format.
 - `DELETE /api/cleanup/{job_id}` - remove output files and forget the job.
 
-All split, job status, payment checkout/confirm, download, cleanup, and profile endpoints require an `Authorization: Bearer <firebase_id_token>` header from Firebase Google Sign-In. Each submitted split job is tied to that signed-in Firebase user.
+All split, job status, payment checkout/status, download, cleanup, and profile endpoints require an `Authorization: Bearer <firebase_id_token>` header from Firebase Google Sign-In. The Stripe webhook endpoint is called by Stripe and is verified with `STRIPE_WEBHOOK_SECRET`. Each submitted split job is tied to that signed-in Firebase user.
 
-Job status responses include `status_detail`, `elapsed_seconds`, and `timeout_seconds` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the preview job status is `done`.
+Job status responses include `status_detail`, `elapsed_seconds`, `timeout_seconds`, and `output_format` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the preview job status is `done`.
 
 ## Local setup
 
@@ -40,13 +42,18 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `ALLOWED_ORIGINS` | `*` | Comma-separated frontend origins. Set this to your Vercel/local frontend URLs in production. |
 | `MAX_FILE_SIZE_MB` | `50` | Upload size limit. |
 | `DEMUCS_TIMEOUT_SECONDS` | `900` | Maximum processing time per job. |
+| `DEMUCS_SHIFTS` | `0` | Demucs test-time shifts. `0` is fastest; raise only if you prefer quality over speed. |
+| `DEMUCS_OVERLAP` | `0.1` | Demucs split overlap. Lower values are faster. |
+| `DEMUCS_JOBS` | `0` | Optional Demucs worker count; `0` leaves the default behavior. |
+| `DEMUCS_DEVICE` | empty | Optional Demucs device override such as `cuda` or `cpu`. |
 | `UPLOAD_DIR` | `uploads` | Temporary upload directory. |
 | `OUTPUT_DIR` | `outputs` | Generated stems directory. |
 | `PREVIEW_DURATION_SECONDS` | `15` | Free preview length to split into vocals and instrumental. |
 | `PAYMENTS_ENABLED` | `false` | Set to `true` to require payment before downloads. |
 | `PRICE_PER_SONG_CENTS` | `300` | Full-song download price in cents; default is `$3.00`. |
 | `PAYMENT_CURRENCY` | `usd` | Currency for Stripe Checkout. |
-| `STRIPE_SECRET_KEY` | empty | Stripe secret key used to create and confirm Checkout sessions. |
+| `STRIPE_SECRET_KEY` | empty | Stripe secret key used only by the FastAPI backend on Railway to create Checkout Sessions. Never expose this in frontend code or `index.html`. |
+| `STRIPE_WEBHOOK_SECRET` | empty | Stripe webhook signing secret used by `/api/stripe/webhook` to verify Stripe events before unlocking downloads. |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
 | `FIREBASE_PROJECT_ID` | empty | Firebase project ID used by Firebase Admin SDK. |
 | `FIREBASE_CLIENT_EMAIL` | empty | Firebase service account client email. |
@@ -65,6 +72,7 @@ export async function splitTrack(file: File, firebaseIdToken: string) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("stems", "2");
+  formData.append("output_format", "mp3"); // or wav, flac, ogg, m4a
 
   const upload = await fetch(`${API_URL}/api/split`, {
     method: "POST",
@@ -97,7 +105,7 @@ export async function splitTrack(file: File, firebaseIdToken: string) {
 }
 
 export async function createDownloadCheckout(firebaseIdToken: string, jobId: string) {
-  const response = await fetch(`${API_URL}/api/payments/checkout`, {
+  const response = await fetch(`${API_URL}/api/create-checkout-session`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -117,10 +125,12 @@ Production checklist for the frontend:
 3. Disable the upload button while a job is processing.
 4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token. Make sure the frontend starts only one polling interval per job and clears it when the job reaches `done` or `error`.
 5. Show the 15-second vocal/instrumental preview after `status === "done"`.
-6. If `PAYMENTS_ENABLED=true`, call `/api/payments/checkout` when the user wants the full song and redirect them to the returned `checkout_url`.
-7. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
+6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) before uploading; send it as `output_format`.
+7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
+8. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; downloads remain locked until that webhook verifies a successful paid session.
+9. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
 
-The simple product is: free 15-second vocal/instrumental preview, then $3 per song for the full download.
+The simple product is: free 15-second vocal/instrumental preview, then a safe Stripe-hosted $3 per song checkout for the full download. The browser only asks the backend to create checkout; the backend creates the Checkout Session and the Stripe webhook is the source of truth for unlocking downloads.
 
 ## Deployment notes
 
@@ -130,4 +140,4 @@ The included Dockerfile installs FFmpeg and Demucs. Railway should use `railway.
 ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
 ```
 
-Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
+For speed, the backend now runs Demucs with no test-time shifts by default and low overlap; set `DEMUCS_DEVICE=cuda` on GPU infrastructure for much faster processing. Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.

@@ -1,8 +1,8 @@
+import hmac
 import json
 import importlib.util
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -13,12 +13,21 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from hashlib import pbkdf2_hmac
+from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any
 
 import static_ffmpeg
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -28,6 +37,7 @@ if importlib.util.find_spec("firebase_admin"):
     from firebase_admin import auth as firebase_auth
     from firebase_admin import credentials
 else:
+
     class FirebaseAdminFallback:
         _apps: dict[str, object] = {}
 
@@ -60,11 +70,13 @@ else:
     except Exception as exc:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
-app = FastAPI(title="Stemify API", version="1.4.0")
+app = FastAPI(title="Stemify API", version="1.5.0")
 
 
 def _split_csv_env(name: str, default: str = "") -> list[str]:
-    return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+    return [
+        item.strip() for item in os.getenv(name, default).split(",") if item.strip()
+    ]
 
 
 # In production, set ALLOWED_ORIGINS to your frontend URL(s), for example:
@@ -90,12 +102,46 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
+DEMUCS_SHIFTS = int(os.getenv("DEMUCS_SHIFTS", "0"))
+DEMUCS_OVERLAP = float(os.getenv("DEMUCS_OVERLAP", "0.1"))
+DEMUCS_JOBS = int(os.getenv("DEMUCS_JOBS", "0"))
+DEMUCS_DEVICE = os.getenv("DEMUCS_DEVICE", "")
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
+OUTPUT_FORMATS = {
+    "wav": {
+        "extension": ".wav",
+        "media_type": "audio/wav",
+        "ffmpeg_args": ["-acodec", "pcm_s16le"],
+    },
+    "mp3": {
+        "extension": ".mp3",
+        "media_type": "audio/mpeg",
+        "ffmpeg_args": ["-codec:a", "libmp3lame", "-b:a", "192k"],
+    },
+    "flac": {
+        "extension": ".flac",
+        "media_type": "audio/flac",
+        "ffmpeg_args": ["-codec:a", "flac"],
+    },
+    "ogg": {
+        "extension": ".ogg",
+        "media_type": "audio/ogg",
+        "ffmpeg_args": ["-codec:a", "libvorbis", "-q:a", "5"],
+    },
+    "m4a": {
+        "extension": ".m4a",
+        "media_type": "audio/mp4",
+        "ffmpeg_args": ["-codec:a", "aac", "-b:a", "192k"],
+    },
+}
 PREVIEW_DURATION_SECONDS = int(os.getenv("PREVIEW_DURATION_SECONDS", "15"))
-PRICE_PER_SONG_CENTS = int(os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "300")))
+PRICE_PER_SONG_CENTS = int(
+    os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "300"))
+)
 PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "false").lower() == "true"
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "usd").lower()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
@@ -109,98 +155,7 @@ STEM_MODELS = {
 # use Redis/Postgres if you scale to multiple workers or need durable history.
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
-SAFE_DOWNLOAD_RE = re.compile(r"^[A-Za-z0-9_. -]+\.wav$")
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-# Simple in-memory auth store. This keeps the current deployment lightweight,
-# while making every split job attributable to a signed-in user. Move these
-# dictionaries to a database before scaling beyond one backend instance.
-USERS: dict[str, dict[str, Any]] = {}
-TOKENS: dict[str, str] = {}
-AUTH_LOCK = threading.Lock()
-PASSWORD_ITERATIONS = 390_000
-PAYMENTS: dict[str, dict[str, Any]] = {}
-PAYMENTS_LOCK = threading.Lock()
-
-
-class AuthRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
-    password: str = Field(min_length=8, max_length=128)
-
-
-class UserProfile(BaseModel):
-    email: str
-    stem_count: int
-    jobs_created: int
-
-
-class AuthResponse(BaseModel):
-    token: str
-    user: UserProfile
-
-
-class CheckoutRequest(BaseModel):
-    job_id: str
-    item_type: str = Field(default="song", pattern="^(song|zip|stem)$")
-    filename: str | None = Field(default=None, max_length=120)
-
-
-class ConfirmPaymentRequest(BaseModel):
-    checkout_session_id: str
-
-
-def normalize_email(email: str) -> str:
-    normalized = email.strip().lower()
-    if not EMAIL_RE.fullmatch(normalized):
-        raise HTTPException(400, "Enter a valid email address.")
-    return normalized
-
-
-def hash_password(password: str, salt: bytes | None = None) -> str:
-    salt = salt or secrets.token_bytes(16)
-    digest = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
-    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
-
-
-def verify_password(password: str, stored_hash: str) -> bool:
-    try:
-        algorithm, iterations, salt_hex, digest_hex = stored_hash.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(digest_hex)
-        actual = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
-        return secrets.compare_digest(actual, expected)
-    except (TypeError, ValueError):
-        return False
-
-
-def public_user(user: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "email": user["email"],
-        "stem_count": user["stem_count"],
-        "jobs_created": user["jobs_created"],
-    }
-
-
-def create_auth_response(user: dict[str, Any]) -> AuthResponse:
-    token = secrets.token_urlsafe(32)
-    with AUTH_LOCK:
-        TOKENS[token] = user["email"]
-    return AuthResponse(token=token, user=UserProfile(**public_user(user)))
-
-
-def current_user(authorization: Annotated[str | None, Header()] = None) -> dict[str, Any]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Authentication required.")
-
-    token = authorization.removeprefix("Bearer ").strip()
-    with AUTH_LOCK:
-        email = TOKENS.get(token)
-        user = USERS.get(email or "")
-    if not user:
-        raise HTTPException(401, "Invalid or expired token.")
-    return user
+SAFE_DOWNLOAD_RE = re.compile(r"^[A-Za-z0-9_. -]+\.(wav|mp3|flac|ogg|m4a)$")
 
 # Simple in-memory user/job stores. Firebase verifies identity; these dicts only
 # keep lightweight per-user usage counts for the current single-instance API.
@@ -223,7 +178,7 @@ class CheckoutRequest(BaseModel):
     filename: str | None = Field(default=None, max_length=120)
 
 
-class ConfirmPaymentRequest(BaseModel):
+class PaymentStatusRequest(BaseModel):
     checkout_session_id: str
 
 
@@ -258,10 +213,16 @@ def public_user(user: dict[str, Any]) -> dict[str, Any]:
 
 
 def usage_user(user: dict[str, Any]) -> dict[str, Any]:
-    return {**public_user(user), "stem_count": user["stem_count"], "jobs_created": user["jobs_created"]}
+    return {
+        **public_user(user),
+        "stem_count": user["stem_count"],
+        "jobs_created": user["jobs_created"],
+    }
 
 
-def current_user(authorization: Annotated[str | None, Header()] = None) -> dict[str, Any]:
+def current_user(
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Authentication required.")
     if not firebase_admin._apps:
@@ -335,7 +296,9 @@ def is_payment_required() -> bool:
     return PAYMENTS_ENABLED
 
 
-def is_download_paid(job_id: str, user: dict[str, Any], item_type: str, filename: str | None = None) -> bool:
+def is_download_paid(
+    job_id: str, user: dict[str, Any], item_type: str, filename: str | None = None
+) -> bool:
     if not is_payment_required():
         return True
 
@@ -346,11 +309,17 @@ def is_download_paid(job_id: str, user: dict[str, Any], item_type: str, filename
             for payment in PAYMENTS.values()
             if payment.get("user_uid") == user["uid"]
             and payment.get("status") == "paid"
+            and payment.get("stripe_event_confirmed") is True
             and payment.get("payment_key") == key
         )
 
 
-def enforce_paid_download(job: dict[str, Any], user: dict[str, Any], item_type: str, filename: str | None = None) -> None:
+def enforce_paid_download(
+    job: dict[str, Any],
+    user: dict[str, Any],
+    item_type: str,
+    filename: str | None = None,
+) -> None:
     if is_download_paid(job["job_id"], user, item_type, filename):
         return
 
@@ -360,7 +329,7 @@ def enforce_paid_download(job: dict[str, Any], user: dict[str, Any], item_type: 
             "message": "Payment required before download.",
             "price_per_song_cents": PRICE_PER_SONG_CENTS,
             "currency": PAYMENT_CURRENCY,
-            "checkout_endpoint": "/api/payments/checkout",
+            "checkout_endpoint": "/api/create-checkout-session",
         },
     )
 
@@ -385,11 +354,15 @@ def checkout_amount_for_job(job: dict[str, Any], item_type: str) -> tuple[int, s
     return PRICE_PER_SONG_CENTS, "Stemify full song download"
 
 
-def stripe_request(method: str, path: str, data: dict[str, str] | None = None) -> dict[str, Any]:
+def stripe_request(
+    method: str, path: str, data: dict[str, str] | None = None
+) -> dict[str, Any]:
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Stripe is not configured.")
 
-    encoded_data = urllib.parse.urlencode(data or {}).encode("utf-8") if data is not None else None
+    encoded_data = (
+        urllib.parse.urlencode(data or {}).encode("utf-8") if data is not None else None
+    )
     request = urllib.request.Request(
         f"https://api.stripe.com/v1{path}",
         data=encoded_data,
@@ -438,6 +411,43 @@ def create_preview_input(job_id: str, input_path: Path) -> Path:
     return preview_path
 
 
+def prepare_output_files(
+    job_id: str, wavs: list[Path], output_format: str
+) -> list[Path]:
+    if output_format == "wav":
+        return wavs
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            f"FFmpeg is required to export {output_format.upper()} stems."
+        )
+
+    format_config = OUTPUT_FORMATS[output_format]
+    converted_dir = OUTPUT_DIR / job_id / output_format
+    converted_dir.mkdir(parents=True, exist_ok=True)
+    converted_files: list[Path] = []
+
+    for wav in wavs:
+        converted = converted_dir / f"{wav.stem}{format_config['extension']}"
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(wav),
+            "-vn",
+            *format_config["ffmpeg_args"],
+            str(converted),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            err = (proc.stderr or "") + (proc.stdout or "")
+            raise RuntimeError(f"{output_format.upper()} export failed: {err[-400:]}")
+        converted_files.append(converted)
+
+    return converted_files
+
+
 @app.get("/api")
 async def root():
     return {
@@ -447,6 +457,14 @@ async def root():
         "allowed_stems": sorted(STEM_MODELS),
         "max_file_size_mb": MAX_FILE_SIZE_MB,
         "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
+        "output_formats": sorted(OUTPUT_FORMATS),
+        "default_output_format": "wav",
+        "performance": {
+            "demucs_shifts": DEMUCS_SHIFTS,
+            "demucs_overlap": DEMUCS_OVERLAP,
+            "demucs_jobs": DEMUCS_JOBS,
+            "demucs_device": DEMUCS_DEVICE or "auto",
+        },
         "payments": {
             "enabled": PAYMENTS_ENABLED,
             "price_per_song_cents": PRICE_PER_SONG_CENTS,
@@ -462,6 +480,7 @@ async def health():
         "ffmpeg_available": shutil.which("ffmpeg") is not None,
         "upload_dir": str(UPLOAD_DIR),
         "output_dir": str(OUTPUT_DIR),
+        "output_formats": sorted(OUTPUT_FORMATS),
     }
 
 
@@ -475,12 +494,14 @@ async def payments_config():
     return {
         "enabled": PAYMENTS_ENABLED,
         "provider": "stripe" if PAYMENTS_ENABLED else None,
+        "checkout_endpoint": "/api/create-checkout-session",
         "price_per_song_cents": PRICE_PER_SONG_CENTS,
         "currency": PAYMENT_CURRENCY,
     }
 
 
 @app.post("/api/payments/checkout")
+@app.post("/api/create-checkout-session")
 async def create_checkout_session(
     payload: CheckoutRequest,
     user: Annotated[dict[str, Any], Depends(current_user)],
@@ -530,9 +551,91 @@ async def create_checkout_session(
     return {"checkout_session_id": session["id"], "checkout_url": session.get("url")}
 
 
+def verify_stripe_webhook_signature(
+    payload: bytes, signature_header: str | None
+) -> None:
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(503, "Stripe webhook signing secret is not configured.")
+    if not signature_header:
+        raise HTTPException(400, "Missing Stripe signature header.")
+
+    parts = dict(
+        item.split("=", 1) for item in signature_header.split(",") if "=" in item
+    )
+    timestamp = parts.get("t")
+    signature = parts.get("v1")
+    if not timestamp or not signature:
+        raise HTTPException(400, "Invalid Stripe signature header.")
+
+    signed_payload = timestamp.encode("utf-8") + b"." + payload
+    expected = hmac.new(
+        STRIPE_WEBHOOK_SECRET.encode("utf-8"), signed_payload, sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(400, "Invalid Stripe webhook signature.")
+
+
+def mark_checkout_session_paid(session: dict[str, Any]) -> dict[str, Any]:
+    session_id = session.get("id")
+    metadata = session.get("metadata") or {}
+    job_id = metadata.get("job_id")
+    item_type = metadata.get("item_type", "song")
+    filename = metadata.get("filename") or None
+    user_uid = metadata.get("user_uid")
+
+    if not session_id or not job_id or not user_uid:
+        raise HTTPException(
+            400, "Stripe session metadata is missing required payment details."
+        )
+
+    with PAYMENTS_LOCK:
+        payment = PAYMENTS.setdefault(
+            session_id,
+            {
+                "checkout_session_id": session_id,
+                "payment_key": payment_key(job_id, item_type, filename),
+                "job_id": job_id,
+                "item_type": item_type,
+                "filename": filename,
+                "user_uid": user_uid,
+                "user_email": metadata.get("user_email")
+                or session.get("customer_email"),
+                "amount_cents": session.get("amount_total"),
+                "currency": (session.get("currency") or PAYMENT_CURRENCY).lower(),
+            },
+        )
+        payment.update(
+            {
+                "status": "paid",
+                "stripe_payment_status": session.get("payment_status"),
+                "stripe_event_confirmed": True,
+            }
+        )
+        return payment.copy()
+
+
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    verify_stripe_webhook_signature(payload, request.headers.get("stripe-signature"))
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "Invalid Stripe webhook payload.") from exc
+
+    if event.get("type") == "checkout.session.completed":
+        session = (event.get("data") or {}).get("object") or {}
+        if session.get("payment_status") == "paid":
+            payment = mark_checkout_session_paid(session)
+            return {"received": True, "status": "paid", "job_id": payment["job_id"]}
+
+    return {"received": True}
+
+
 @app.post("/api/payments/confirm")
-async def confirm_checkout_session(
-    payload: ConfirmPaymentRequest,
+async def payment_status(
+    payload: PaymentStatusRequest,
     user: Annotated[dict[str, Any], Depends(current_user)],
 ):
     if not PAYMENTS_ENABLED:
@@ -543,14 +646,11 @@ async def confirm_checkout_session(
     if not payment or payment.get("user_uid") != user["uid"]:
         raise HTTPException(404, "Payment not found.")
 
-    session = stripe_request("GET", f"/checkout/sessions/{urllib.parse.quote(payload.checkout_session_id)}")
-    if session.get("payment_status") != "paid":
-        return {"status": "pending", "payment_status": session.get("payment_status")}
-
-    with PAYMENTS_LOCK:
-        payment["status"] = "paid"
-        payment["stripe_payment_status"] = session.get("payment_status")
-    return {"status": "paid", "job_id": payment["job_id"], "item_type": payment["item_type"]}
+    return {
+        "status": payment.get("status", "pending"),
+        "job_id": payment["job_id"],
+        "item_type": payment["item_type"],
+    }
 
 
 @app.post("/api/split")
@@ -558,9 +658,19 @@ async def split_audio(
     user: Annotated[dict[str, Any], Depends(current_user)],
     file: UploadFile = File(...),
     stems: int = Form(2),
+    output_format: str = Form("wav"),
 ):
     if stems not in STEM_MODELS:
-        raise HTTPException(400, "Stemify only supports 2 stems: vocals and instrumental.")
+        raise HTTPException(
+            400, "Stemify only supports 2 stems: vocals and instrumental."
+        )
+
+    output_format = output_format.strip().lower()
+    if output_format not in OUTPUT_FORMATS:
+        raise HTTPException(
+            400,
+            f"Unsupported output format: {output_format or 'none'}. Choose one of: {', '.join(sorted(OUTPUT_FORMATS))}.",
+        )
 
     original_name = Path(file.filename or "").name
     suffix = Path(original_name).suffix.lower()
@@ -570,7 +680,9 @@ async def split_audio(
     contents = await file.read(MAX_FILE_SIZE_BYTES + 1)
     if len(contents) > MAX_FILE_SIZE_BYTES:
         size_mb = len(contents) / (1024 * 1024)
-        raise HTTPException(413, f"File too large ({size_mb:.1f} MB). Max {MAX_FILE_SIZE_MB} MB.")
+        raise HTTPException(
+            413, f"File too large ({size_mb:.1f} MB). Max {MAX_FILE_SIZE_MB} MB."
+        )
     if not contents:
         raise HTTPException(400, "Uploaded file is empty.")
 
@@ -597,6 +709,7 @@ async def split_audio(
             "user_email": user["email"],
             "requested_stems": stems,
             "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
+            "output_format": output_format,
             "started_at": now,
             "updated_at": now,
         }
@@ -606,7 +719,7 @@ async def split_audio(
 
     thread = threading.Thread(
         target=run_demucs,
-        args=(job_id, job_dir, input_path, stems, safe_stem),
+        args=(job_id, job_dir, input_path, stems, safe_stem, output_format),
         daemon=True,
     )
     thread.start()
@@ -618,18 +731,45 @@ async def split_audio(
             "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
             "track_name": safe_stem,
             "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
+            "output_format": output_format,
+            "available_output_formats": sorted(OUTPUT_FORMATS),
             "user": usage_user(user),
         }
     )
 
 
-def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_name: str) -> None:
+def run_demucs(
+    job_id: str,
+    job_dir: Path,
+    input_path: Path,
+    stems: int,
+    track_name: str,
+    output_format: str,
+) -> None:
     preview_path: Path | None = None
     try:
-        update_job(job_id, status_detail=f"Creating {PREVIEW_DURATION_SECONDS}-second preview.")
+        update_job(
+            job_id, status_detail=f"Creating {PREVIEW_DURATION_SECONDS}-second preview."
+        )
         preview_path = create_preview_input(job_id, input_path)
         model = STEM_MODELS[stems]
-        cmd = [sys.executable, "-m", "demucs", "-n", model, "--out", str(job_dir)]
+        cmd = [
+            sys.executable,
+            "-m",
+            "demucs",
+            "-n",
+            model,
+            "--out",
+            str(job_dir),
+            "--shifts",
+            str(DEMUCS_SHIFTS),
+            "--overlap",
+            str(DEMUCS_OVERLAP),
+        ]
+        if DEMUCS_JOBS > 0:
+            cmd += ["--jobs", str(DEMUCS_JOBS)]
+        if DEMUCS_DEVICE:
+            cmd += ["--device", DEMUCS_DEVICE]
         if stems == 2:
             cmd += ["--two-stems", "vocals"]
         cmd.append(str(preview_path))
@@ -641,7 +781,9 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
             ),
         )
         print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DEMUCS_TIMEOUT_SECONDS)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=DEMUCS_TIMEOUT_SECONDS
+        )
         print(f"[JOB {job_id[:8]}] STDOUT:\n{proc.stdout[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] STDERR:\n{proc.stderr[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] RETURN CODE: {proc.returncode}", flush=True)
@@ -657,7 +799,10 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
             )
             return
 
-        update_job(job_id, status_detail="Finalizing preview stem files.")
+        update_job(
+            job_id,
+            status_detail=f"Finalizing preview stem files as {output_format.upper()}.",
+        )
         wavs = sorted(job_dir.rglob("*.wav"))
         if not wavs:
             update_job(
@@ -668,13 +813,17 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
             )
             return
 
-        zip_path = job_dir / f"stemify_{track_name}.zip"
+        output_files = prepare_output_files(job_id, wavs, output_format)
+        zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for wav in wavs:
-                zf.write(wav, arcname=wav.name)
+            for stem_file in output_files:
+                zf.write(stem_file, arcname=stem_file.name)
 
-        stem_names = [w.stem for w in wavs]
-        stem_urls = {w.stem: f"/api/download/{job_id}/stem/{w.name}" for w in wavs}
+        stem_names = [stem_file.stem for stem_file in output_files]
+        stem_urls = {
+            stem_file.stem: f"/api/download/{job_id}/stem/{stem_file.name}"
+            for stem_file in output_files
+        }
         update_job(
             job_id,
             status="done",
@@ -682,6 +831,7 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
             stems=stem_names,
             zip_url=f"/api/download/{job_id}/zip",
             stem_urls=stem_urls,
+            output_format=output_format,
         )
         print(f"[JOB {job_id[:8]}] Done: {stem_names}")
 
@@ -693,7 +843,12 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
             error=f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds. Try a shorter track.",
         )
     except Exception as exc:
-        update_job(job_id, status="error", status_detail="Preview stem separation crashed.", error=str(exc))
+        update_job(
+            job_id,
+            status="error",
+            status_detail="Preview stem separation crashed.",
+            error=str(exc),
+        )
         print(f"[JOB {job_id[:8]}] Exception: {exc}")
     finally:
         input_path.unlink(missing_ok=True)
@@ -702,12 +857,16 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
 
 
 @app.get("/api/job/{job_id}")
-async def job_status(job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
+async def job_status(
+    job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
+):
     return JSONResponse(get_authorized_job(job_id, user))
 
 
 @app.get("/api/download/{job_id}/zip")
-async def download_zip(job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
+async def download_zip(
+    job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
+):
     job = get_authorized_job(job_id, user)
     enforce_job_done(job)
     enforce_paid_download(job, user, "zip")
@@ -739,7 +898,9 @@ async def download_stem(
     matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
     if not matches:
         raise HTTPException(404, "Stem not found.")
-    return FileResponse(matches[0], media_type="audio/wav", filename=filename)
+    extension = matches[0].suffix.lower().lstrip(".")
+    media_type = OUTPUT_FORMATS.get(extension, OUTPUT_FORMATS["wav"])["media_type"]
+    return FileResponse(matches[0], media_type=media_type, filename=filename)
 
 
 @app.delete("/api/cleanup/{job_id}")
