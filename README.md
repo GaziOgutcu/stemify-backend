@@ -1,6 +1,6 @@
 # Stemify Backend
 
-FastAPI backend for uploading an audio file and splitting a 15-second preview into vocals and instrumental with Demucs, with optional Stripe Checkout for a safe $3 full-song download flow.
+FastAPI backend for uploading an audio file and splitting a 15-second preview into vocals and instrumental with Demucs, with optional Stripe Checkout for a safe $3 AUD full-song download flow.
 
 ## API endpoints
 
@@ -8,9 +8,10 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
 - `GET /api/health` - health check for deployments.
 - `GET /api/me` - return the signed-in Firebase user's `uid`, `email`, `name`, and `provider`.
 - `GET /api/payments/config` - return paid-download settings such as price per song and currency.
-- `POST /api/create-checkout-session` - frontend-safe endpoint that creates a Stripe Checkout Session from the FastAPI backend when paid downloads are enabled.
+- `POST /api/create-checkout-session` - frontend-safe endpoint that creates a Stripe Checkout Session for a specific `job_id` from the FastAPI backend when paid downloads are enabled.
 - `POST /api/stripe/webhook` - Stripe webhook endpoint that confirms successful payment before downloads are unlocked.
-- `POST /api/payments/confirm` - verify a Stripe Checkout Session with Stripe using the backend secret key and return whether the signed-in user has paid.
+- `GET /api/payment/verify?session_id=...&job_id=...` - verify a Stripe Checkout Session with Stripe using the backend secret key, ensure it belongs to the requested job and signed-in user, mark the job paid, and return download URLs.
+- `POST /api/payments/confirm` - legacy payment verification endpoint that verifies a Stripe Checkout Session with Stripe using the backend secret key and returns whether the signed-in user has paid.
 - `POST /api/split` - multipart form upload with:
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
   - `stems`: always `2` for vocals and instrumental
@@ -55,7 +56,7 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `PREVIEW_DURATION_SECONDS` | `15` | Free preview length to split into vocals and instrumental. |
 | `PAYMENTS_ENABLED` | `true` when `STRIPE_SECRET_KEY` is present, otherwise `false` | Explicit feature flag for paid downloads and Checkout. Set to `true` in production, or leave unset when `STRIPE_SECRET_KEY` is configured. |
 | `PRICE_PER_SONG_CENTS` | `300` | Full-song download price in cents; default is `$3.00`. |
-| `PAYMENT_CURRENCY` | `usd` | Currency for Stripe Checkout. |
+| `PAYMENT_CURRENCY` | `aud` | Currency for Stripe Checkout. The production default is AUD for the $3.00 AUD download. |
 | `STRIPE_SECRET_KEY` | empty | Stripe secret key used only by the FastAPI backend on Railway to create Checkout Sessions. If present and `PAYMENTS_ENABLED` is unset, paid downloads are enabled automatically. Never expose this in frontend code or `index.html`. |
 | `STRIPE_WEBHOOK_SECRET` | empty | Stripe webhook signing secret used by `/api/stripe/webhook` to verify Stripe events before unlocking downloads. |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
@@ -131,12 +132,13 @@ Production checklist for the frontend:
 5. Show the 15-second vocal/instrumental preview after `status === "done"`.
 6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) before uploading; send it as `output_format`.
 7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
-8. For a static Vercel `index.html`, Stripe redirects back to `/?payment=success&session_id={CHECKOUT_SESSION_ID}` or `/?payment=cancelled`; parse those query params in `index.html`, but never unlock downloads from query params alone.
-9. When `payment=success`, call `POST /api/payments/confirm` with the bearer token and `{ "checkout_session_id": sessionId }`; the backend retrieves the Checkout Session from Stripe and only returns `paid` when Stripe says it is paid.
-10. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; webhook confirmation is still accepted, and backend Stripe API verification covers the immediate post-checkout redirect path.
-11. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
+8. For a static Vercel `index.html`, store the current `job_id`, selected filename, and UI state in `localStorage` as soon as `/api/split` returns. Stripe redirects back to `/?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=<job_id>` or `/?payment=cancelled&job_id=<job_id>`; parse those query params in `index.html`, but never unlock downloads from query params alone.
+9. When `payment=success`, show a "Payment successful. Preparing your download..." message and call `GET /api/payment/verify?session_id=<session_id>&job_id=<job_id>` with the bearer token. The backend retrieves the Checkout Session from Stripe, verifies the session/job/user mapping, marks the job paid, and returns download URLs only when Stripe says it is paid.
+10. When `payment=cancelled`, restore the saved job state from `localStorage` and show "Payment cancelled. Your preview is still available." Do not reset the upload UI after returning from Stripe; if `localStorage` has a previous `job_id`, offer a "Resume previous split" action.
+11. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; webhook confirmation is still accepted, and backend Stripe API verification covers the immediate post-checkout redirect path.
+12. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
 
-The simple product is: free 15-second vocal/instrumental preview, then a safe Stripe-hosted $3 per song checkout for the full download. The browser only asks the backend to create checkout and verify a returned session ID; the backend creates the Checkout Session, verifies session ownership/status with Stripe, and also accepts verified Stripe webhooks for unlocking downloads.
+The simple product is: free 15-second vocal/instrumental preview, then a safe Stripe-hosted $3 AUD per song checkout for the full download. The browser only asks the backend to create checkout and verify a returned session ID; the backend creates the Checkout Session, verifies session ownership/status with Stripe, and also accepts verified Stripe webhooks for unlocking downloads.
 
 ## Deployment notes
 
