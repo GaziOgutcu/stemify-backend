@@ -10,7 +10,7 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
 - `GET /api/payments/config` - return paid-download settings such as price per song and currency.
 - `POST /api/create-checkout-session` - frontend-safe endpoint that creates a Stripe Checkout Session from the FastAPI backend when paid downloads are enabled.
 - `POST /api/stripe/webhook` - Stripe webhook endpoint that confirms successful payment before downloads are unlocked.
-- `POST /api/payments/confirm` - return local payment status after the webhook has run; it does not confirm payment itself.
+- `POST /api/payments/confirm` - verify a Stripe Checkout Session with Stripe using the backend secret key and return whether the signed-in user has paid.
 - `POST /api/split` - multipart form upload with:
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
   - `stems`: always `2` for vocals and instrumental
@@ -131,10 +131,12 @@ Production checklist for the frontend:
 5. Show the 15-second vocal/instrumental preview after `status === "done"`.
 6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) before uploading; send it as `output_format`.
 7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
-8. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; downloads remain locked until that webhook verifies a successful paid session.
-9. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
+8. For a static Vercel `index.html`, Stripe redirects back to `/?payment=success&session_id={CHECKOUT_SESSION_ID}` or `/?payment=cancelled`; parse those query params in `index.html`, but never unlock downloads from query params alone.
+9. When `payment=success`, call `POST /api/payments/confirm` with the bearer token and `{ "checkout_session_id": sessionId }`; the backend retrieves the Checkout Session from Stripe and only returns `paid` when Stripe says it is paid.
+10. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; webhook confirmation is still accepted, and backend Stripe API verification covers the immediate post-checkout redirect path.
+11. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
 
-The simple product is: free 15-second vocal/instrumental preview, then a safe Stripe-hosted $3 per song checkout for the full download. The browser only asks the backend to create checkout; the backend creates the Checkout Session and the Stripe webhook is the source of truth for unlocking downloads.
+The simple product is: free 15-second vocal/instrumental preview, then a safe Stripe-hosted $3 per song checkout for the full download. The browser only asks the backend to create checkout and verify a returned session ID; the backend creates the Checkout Session, verifies session ownership/status with Stripe, and also accepts verified Stripe webhooks for unlocking downloads.
 
 ## Deployment notes
 

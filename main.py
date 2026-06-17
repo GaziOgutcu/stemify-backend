@@ -360,7 +360,10 @@ def is_download_paid(
             for payment in PAYMENTS.values()
             if payment.get("user_uid") == user["uid"]
             and payment.get("status") == "paid"
-            and payment.get("stripe_event_confirmed") is True
+            and (
+                payment.get("stripe_event_confirmed") is True
+                or payment.get("stripe_api_verified") is True
+            )
             and payment.get("payment_key") == key
         )
 
@@ -458,6 +461,19 @@ def stripe_request(
 
 def json_loads(raw: bytes) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
+
+
+def checkout_success_url() -> str:
+    return f"{FRONTEND_URL}/?payment=success&session_id={{CHECKOUT_SESSION_ID}}"
+
+
+def checkout_cancel_url() -> str:
+    return f"{FRONTEND_URL}/?payment=cancelled"
+
+
+def retrieve_checkout_session(checkout_session_id: str) -> dict[str, Any]:
+    quoted_session_id = urllib.parse.quote(checkout_session_id, safe="")
+    return stripe_request("GET", f"/checkout/sessions/{quoted_session_id}")
 
 
 def create_preview_input(job_id: str, input_path: Path) -> Path:
@@ -606,8 +622,8 @@ async def create_checkout_session(
         amount_cents,
         PAYMENT_CURRENCY,
         stripe_key_mode(),
-        f"{FRONTEND_URL}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}",
-        f"{FRONTEND_URL}/checkout/cancel",
+        checkout_success_url(),
+        checkout_cancel_url(),
     )
     session = stripe_request(
         "POST",
@@ -615,8 +631,8 @@ async def create_checkout_session(
         {
             "mode": "payment",
             "customer_email": user["email"],
-            "success_url": f"{FRONTEND_URL}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}",
-            "cancel_url": f"{FRONTEND_URL}/checkout/cancel",
+            "success_url": checkout_success_url(),
+            "cancel_url": checkout_cancel_url(),
             "line_items[0][quantity]": "1",
             "line_items[0][price_data][currency]": PAYMENT_CURRENCY,
             "line_items[0][price_data][unit_amount]": str(amount_cents),
@@ -670,7 +686,9 @@ def verify_stripe_webhook_signature(
         raise HTTPException(400, "Invalid Stripe webhook signature.")
 
 
-def mark_checkout_session_paid(session: dict[str, Any]) -> dict[str, Any]:
+def mark_checkout_session_paid(
+    session: dict[str, Any], verification_source: str = "webhook"
+) -> dict[str, Any]:
     session_id = session.get("id")
     metadata = session.get("metadata") or {}
     job_id = metadata.get("job_id")
@@ -703,9 +721,13 @@ def mark_checkout_session_paid(session: dict[str, Any]) -> dict[str, Any]:
             {
                 "status": "paid",
                 "stripe_payment_status": session.get("payment_status"),
-                "stripe_event_confirmed": True,
+                "stripe_verification_source": verification_source,
             }
         )
+        if verification_source == "webhook":
+            payment["stripe_event_confirmed"] = True
+        if verification_source == "api":
+            payment["stripe_api_verified"] = True
         return payment.copy()
 
 
@@ -733,16 +755,57 @@ async def payment_status(
     payload: PaymentStatusRequest,
     user: Annotated[dict[str, Any], Depends(current_user)],
 ):
-    if not PAYMENTS_ENABLED:
-        raise HTTPException(503, "Payments are not enabled on this server.")
+    validate_checkout_configuration()
 
     with PAYMENTS_LOCK:
         payment = PAYMENTS.get(payload.checkout_session_id)
-    if not payment or payment.get("user_uid") != user["uid"]:
+
+    if payment and payment.get("user_uid") != user["uid"]:
         raise HTTPException(404, "Payment not found.")
+
+    session = retrieve_checkout_session(payload.checkout_session_id)
+    metadata = session.get("metadata") or {}
+    if metadata.get("user_uid") != user["uid"]:
+        raise HTTPException(404, "Payment not found.")
+
+    if session.get("payment_status") == "paid":
+        payment = mark_checkout_session_paid(session, verification_source="api")
+    elif not payment:
+        with PAYMENTS_LOCK:
+            payment = PAYMENTS.setdefault(
+                payload.checkout_session_id,
+                {
+                    "checkout_session_id": payload.checkout_session_id,
+                    "payment_key": payment_key(
+                        metadata.get("job_id", ""),
+                        metadata.get("item_type", "song"),
+                        metadata.get("filename") or None,
+                    ),
+                    "job_id": metadata.get("job_id"),
+                    "item_type": metadata.get("item_type", "song"),
+                    "filename": metadata.get("filename") or None,
+                    "user_uid": user["uid"],
+                    "user_email": metadata.get("user_email")
+                    or session.get("customer_email"),
+                    "status": "pending",
+                    "stripe_payment_status": session.get("payment_status"),
+                    "amount_cents": session.get("amount_total"),
+                    "currency": (session.get("currency") or PAYMENT_CURRENCY).lower(),
+                },
+            ).copy()
+    else:
+        with PAYMENTS_LOCK:
+            payment.update(
+                {
+                    "status": "pending",
+                    "stripe_payment_status": session.get("payment_status"),
+                }
+            )
+            payment = payment.copy()
 
     return {
         "status": payment.get("status", "pending"),
+        "stripe_payment_status": payment.get("stripe_payment_status"),
         "job_id": payment["job_id"],
         "item_type": payment["item_type"],
     }
