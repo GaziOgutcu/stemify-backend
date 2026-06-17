@@ -7,4 +7,4 @@ torchaudio>=2.0.0
 static-ffmpeg>=2.5
 torchcodec
 firebase-admin>=6.5.0
-diffq==0.2.3
+diffq>=0.2.1

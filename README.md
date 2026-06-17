@@ -140,7 +140,7 @@ The simple product is: free 15-second vocal/instrumental preview, then a safe St
 
 ## Deployment notes
 
-The included Dockerfile installs FFmpeg and Demucs. Railway should use `railway.toml`; set `ALLOWED_ORIGINS` to your frontend origin, for example:
+The included Dockerfile installs FFmpeg, Demucs, and DiffQ for the default quantized `mdx_q` model. Railway should use `railway.toml`; set `ALLOWED_ORIGINS` to your frontend origin, for example:
 
 ```text
 ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000

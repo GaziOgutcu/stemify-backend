@@ -2,6 +2,7 @@ import hmac
 import json
 import time
 from hashlib import sha256
+from pathlib import Path
 import threading
 import zipfile
 
@@ -351,6 +352,12 @@ def test_stripe_webhook_marks_payment_paid(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "paid"
     assert main.PAYMENTS["cs_paid"]["status"] == "paid"
+
+
+def test_requirements_include_diffq_for_quantized_demucs_model():
+    requirements = Path("requirements.txt").read_text()
+
+    assert "diffq" in requirements
 
 
 def test_demucs_command_uses_fast_defaults(tmp_path, monkeypatch):
