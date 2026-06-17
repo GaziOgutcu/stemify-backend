@@ -119,6 +119,85 @@ def test_create_checkout_session_available_on_frontend_endpoint(monkeypatch):
     assert main.PAYMENTS["cs_test_123"]["status"] == "pending"
 
 
+def test_create_checkout_session_uses_legacy_payments_endpoint(monkeypatch):
+    job_id = "checkout-legacy-job"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_live_backend_only")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "requested_stems": 2,
+    }
+
+    def fake_stripe_request(method, path, data=None):
+        assert data["success_url"].startswith("http://localhost:3000/checkout/success")
+        assert data["cancel_url"] == "http://localhost:3000/checkout/cancel"
+        assert data["line_items[0][price_data][unit_amount]"] == "300"
+        assert data["line_items[0][price_data][currency]"] == "usd"
+        return {"id": "cs_live_123", "url": "https://checkout.stripe.com/session"}
+
+    monkeypatch.setattr(main, "stripe_request", fake_stripe_request)
+
+    response = client.post(
+        "/api/payments/checkout",
+        json={"job_id": job_id, "item_type": "song"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["checkout_session_id"] == "cs_live_123"
+
+
+def test_checkout_reports_specific_configuration_error_when_payments_disabled(
+    monkeypatch,
+):
+    job_id = "checkout-disabled-job"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", False)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_live_backend_only")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+    }
+
+    response = client.post(
+        "/api/payments/checkout",
+        json={"job_id": job_id, "item_type": "song"},
+        headers=headers,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Payments are not enabled on this server."
+
+
+def test_checkout_rejects_non_absolute_frontend_url(monkeypatch):
+    job_id = "checkout-url-job"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_live_backend_only")
+    monkeypatch.setattr(main, "FRONTEND_URL", "stemify.app")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+    }
+
+    response = client.post(
+        "/api/create-checkout-session",
+        json={"job_id": job_id, "item_type": "song"},
+        headers=headers,
+    )
+
+    assert response.status_code == 503
+    assert (
+        response.json()["detail"]
+        == "Checkout redirect URL is not configured correctly."
+    )
+
+
 def test_payment_status_does_not_confirm_without_webhook(monkeypatch):
     headers = auth_headers()
     monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
