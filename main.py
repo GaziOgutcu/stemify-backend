@@ -1,6 +1,7 @@
 import hmac
 import json
 import importlib.util
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import zipfile
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlparse
 
 import static_ffmpeg
 from fastapi import (
@@ -71,6 +73,7 @@ else:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
 app = FastAPI(title="Stemify API", version="1.5.0")
+logger = logging.getLogger("stemify.stripe")
 
 
 def _split_csv_env(name: str, default: str = "") -> list[str]:
@@ -138,9 +141,12 @@ PREVIEW_DURATION_SECONDS = int(os.getenv("PREVIEW_DURATION_SECONDS", "15"))
 PRICE_PER_SONG_CENTS = int(
     os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "300"))
 )
-PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "false").lower() == "true"
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+PAYMENTS_ENABLED = (
+    os.getenv("PAYMENTS_ENABLED", "true" if STRIPE_SECRET_KEY else "false").lower()
+    == "true"
+)
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "usd").lower()
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
@@ -296,6 +302,46 @@ def is_payment_required() -> bool:
     return PAYMENTS_ENABLED
 
 
+def stripe_key_mode() -> str:
+    if STRIPE_SECRET_KEY.startswith("sk_live_"):
+        return "live"
+    if STRIPE_SECRET_KEY.startswith("sk_test_"):
+        return "test"
+    return "unknown" if STRIPE_SECRET_KEY else "missing"
+
+
+def validate_checkout_configuration() -> None:
+    if not PAYMENTS_ENABLED:
+        logger.warning("Checkout rejected because PAYMENTS_ENABLED is false.")
+        raise HTTPException(503, "Payments are not enabled on this server.")
+    if not STRIPE_SECRET_KEY:
+        logger.error("Checkout rejected because STRIPE_SECRET_KEY is missing.")
+        raise HTTPException(503, "Stripe is not configured on this server.")
+    if not STRIPE_SECRET_KEY.startswith(("sk_live_", "sk_test_")):
+        logger.error(
+            "Checkout rejected because STRIPE_SECRET_KEY has an invalid prefix."
+        )
+        raise HTTPException(503, "Stripe secret key is invalid on this server.")
+    parsed_frontend = urlparse(FRONTEND_URL)
+    if parsed_frontend.scheme not in {"http", "https"} or not parsed_frontend.netloc:
+        logger.error(
+            "Checkout rejected because FRONTEND_URL is not absolute: %s", FRONTEND_URL
+        )
+        raise HTTPException(503, "Checkout redirect URL is not configured correctly.")
+    if PRICE_PER_SONG_CENTS < 50:
+        logger.error(
+            "Checkout rejected because PRICE_PER_SONG_CENTS is too low: %s",
+            PRICE_PER_SONG_CENTS,
+        )
+        raise HTTPException(503, "Checkout price is not configured correctly.")
+    if not re.fullmatch(r"[a-z]{3}", PAYMENT_CURRENCY):
+        logger.error(
+            "Checkout rejected because PAYMENT_CURRENCY is invalid: %s",
+            PAYMENT_CURRENCY,
+        )
+        raise HTTPException(503, "Checkout currency is not configured correctly.")
+
+
 def is_download_paid(
     job_id: str, user: dict[str, Any], item_type: str, filename: str | None = None
 ) -> bool:
@@ -358,8 +404,15 @@ def stripe_request(
     method: str, path: str, data: dict[str, str] | None = None
 ) -> dict[str, Any]:
     if not STRIPE_SECRET_KEY:
+        logger.error("Stripe request blocked because STRIPE_SECRET_KEY is missing.")
         raise HTTPException(503, "Stripe is not configured.")
 
+    logger.info(
+        "Creating Stripe request method=%s path=%s key_mode=%s",
+        method,
+        path,
+        stripe_key_mode(),
+    )
     encoded_data = (
         urllib.parse.urlencode(data or {}).encode("utf-8") if data is not None else None
     )
@@ -377,9 +430,25 @@ def stripe_request(
             return json_loads(response.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise HTTPException(exc.code, f"Stripe error: {detail}") from exc
+        logger.exception(
+            "Stripe API HTTP error status=%s response=%s", exc.code, detail
+        )
+        try:
+            stripe_error = json.loads(detail).get("error", {})
+            message = stripe_error.get("message") or detail
+            code = stripe_error.get("code")
+        except json.JSONDecodeError:
+            message = detail
+            code = None
+        public_detail = {"message": message}
+        if code:
+            public_detail["code"] = code
+        raise HTTPException(exc.code, public_detail) from exc
     except urllib.error.URLError as exc:
-        raise HTTPException(503, f"Stripe request failed: {exc.reason}") from exc
+        logger.exception("Stripe API connection failed: %s", exc.reason)
+        raise HTTPException(
+            503, {"message": f"Stripe request failed: {exc.reason}"}
+        ) from exc
 
 
 def json_loads(raw: bytes) -> dict[str, Any]:
@@ -506,14 +575,31 @@ async def create_checkout_session(
     payload: CheckoutRequest,
     user: Annotated[dict[str, Any], Depends(current_user)],
 ):
-    if not PAYMENTS_ENABLED:
-        raise HTTPException(400, "Payments are disabled.")
+    validate_checkout_configuration()
 
     job = get_authorized_job(payload.job_id, user)
     enforce_job_done(job)
     filename = None
 
     amount_cents, product_name = checkout_amount_for_job(job, payload.item_type)
+    if amount_cents < 50:
+        logger.error(
+            "Checkout rejected for job_id=%s because amount_cents=%s",
+            payload.job_id,
+            amount_cents,
+        )
+        raise HTTPException(503, "Checkout price is not configured correctly.")
+    logger.info(
+        "Creating Stripe Checkout Session job_id=%s user_uid=%s item_type=%s amount_cents=%s currency=%s key_mode=%s success_url=%s cancel_url=%s",
+        payload.job_id,
+        user["uid"],
+        payload.item_type,
+        amount_cents,
+        PAYMENT_CURRENCY,
+        stripe_key_mode(),
+        f"{FRONTEND_URL}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}",
+        f"{FRONTEND_URL}/checkout/cancel",
+    )
     session = stripe_request(
         "POST",
         "/checkout/sessions",
@@ -639,7 +725,7 @@ async def payment_status(
     user: Annotated[dict[str, Any], Depends(current_user)],
 ):
     if not PAYMENTS_ENABLED:
-        raise HTTPException(400, "Payments are disabled.")
+        raise HTTPException(503, "Payments are not enabled on this server.")
 
     with PAYMENTS_LOCK:
         payment = PAYMENTS.get(payload.checkout_session_id)

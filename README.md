@@ -49,10 +49,10 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `UPLOAD_DIR` | `uploads` | Temporary upload directory. |
 | `OUTPUT_DIR` | `outputs` | Generated stems directory. |
 | `PREVIEW_DURATION_SECONDS` | `15` | Free preview length to split into vocals and instrumental. |
-| `PAYMENTS_ENABLED` | `false` | Set to `true` to require payment before downloads. |
+| `PAYMENTS_ENABLED` | `true` when `STRIPE_SECRET_KEY` is present, otherwise `false` | Explicit feature flag for paid downloads and Checkout. Set to `true` in production, or leave unset when `STRIPE_SECRET_KEY` is configured. |
 | `PRICE_PER_SONG_CENTS` | `300` | Full-song download price in cents; default is `$3.00`. |
 | `PAYMENT_CURRENCY` | `usd` | Currency for Stripe Checkout. |
-| `STRIPE_SECRET_KEY` | empty | Stripe secret key used only by the FastAPI backend on Railway to create Checkout Sessions. Never expose this in frontend code or `index.html`. |
+| `STRIPE_SECRET_KEY` | empty | Stripe secret key used only by the FastAPI backend on Railway to create Checkout Sessions. If present and `PAYMENTS_ENABLED` is unset, paid downloads are enabled automatically. Never expose this in frontend code or `index.html`. |
 | `STRIPE_WEBHOOK_SECRET` | empty | Stripe webhook signing secret used by `/api/stripe/webhook` to verify Stripe events before unlocking downloads. |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
 | `FIREBASE_PROJECT_ID` | empty | Firebase project ID used by Firebase Admin SDK. |
