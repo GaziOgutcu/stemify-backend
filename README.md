@@ -1,6 +1,6 @@
 # Stemify Backend
 
-FastAPI backend for uploading an audio file and splitting it into stems with Demucs.
+FastAPI backend for uploading an audio file and splitting a 15-second preview into vocals and instrumental with Demucs.
 
 ## API endpoints
 
@@ -10,12 +10,12 @@ FastAPI backend for uploading an audio file and splitting it into stems with Dem
 - `POST /api/auth/signin` - sign in with `email` and `password`, returning a bearer token and user stem totals.
 - `GET /api/auth/social/providers` - list social sign-in providers configured for the frontend, such as Google or Apple.
 - `GET /api/me` - return the signed-in user's profile and stem usage totals.
-- `GET /api/payments/config` - return paid-download settings such as price per stem and currency.
-- `POST /api/payments/checkout` - create a Stripe Checkout session for a stem or ZIP download when paid downloads are enabled.
+- `GET /api/payments/config` - return paid-download settings such as price per song and currency.
+- `POST /api/payments/checkout` - create a Stripe Checkout session for a full-song download when paid downloads are enabled.
 - `POST /api/payments/confirm` - confirm a Stripe Checkout session before allowing paid downloads.
 - `POST /api/split` - multipart form upload with:
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
-  - `stems`: `2`, `4`, or `6` (defaults to `4`)
+  - `stems`: always `2` for vocals and instrumental
 - `GET /api/job/{job_id}` - poll job status until it is `done` or `error`.
 - `GET /api/download/{job_id}/zip` - download all produced stems as a ZIP.
 - `GET /api/download/{job_id}/stem/{filename}` - download one WAV stem.
@@ -23,7 +23,7 @@ FastAPI backend for uploading an audio file and splitting it into stems with Dem
 
 All split, job status, payment checkout/confirm, download, cleanup, and profile endpoints require an `Authorization: Bearer <token>` header from sign up or sign in. Each submitted split job is tied to that signed-in user, and the API increments the user's `jobs_created` and `stem_count` totals when the job is accepted.
 
-Job status responses include `status_detail`, `elapsed_seconds`, and `timeout_seconds` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the job status is `done`.
+Job status responses include `status_detail`, `elapsed_seconds`, and `timeout_seconds` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the preview job status is `done`.
 
 Social sign in is not fully automatic from the backend alone. The frontend still needs Google/Apple buttons and provider SDKs, plus production token verification on the backend. `GET /api/auth/social/providers` exposes which providers are configured so the HTML can show or hide those buttons.
 
@@ -47,8 +47,9 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `DEMUCS_TIMEOUT_SECONDS` | `900` | Maximum processing time per job. |
 | `UPLOAD_DIR` | `uploads` | Temporary upload directory. |
 | `OUTPUT_DIR` | `outputs` | Generated stems directory. |
+| `PREVIEW_DURATION_SECONDS` | `15` | Free preview length to split into vocals and instrumental. |
 | `PAYMENTS_ENABLED` | `false` | Set to `true` to require payment before downloads. |
-| `PRICE_PER_STEM_CENTS` | `300` | Download price per stem in cents; default is `$3.00`. |
+| `PRICE_PER_SONG_CENTS` | `300` | Full-song download price in cents; default is `$3.00`. |
 | `PAYMENT_CURRENCY` | `usd` | Currency for Stripe Checkout. |
 | `STRIPE_SECRET_KEY` | empty | Stripe secret key used to create and confirm Checkout sessions. |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
@@ -77,10 +78,10 @@ export async function signUp(email: string, password: string) {
   }>;
 }
 
-export async function splitTrack(file: File, token: string, stems = 4) {
+export async function splitTrack(file: File, token: string) {
   const formData = new FormData();
   formData.append("file", file);
-  formData.append("stems", String(stems));
+  formData.append("stems", "2");
 
   const upload = await fetch(`${API_URL}/api/split`, {
     method: "POST",
@@ -125,14 +126,14 @@ export async function getSocialProviders() {
   }>;
 }
 
-export async function createDownloadCheckout(token: string, jobId: string, itemType: "zip" | "stem", filename?: string) {
+export async function createDownloadCheckout(token: string, jobId: string) {
   const response = await fetch(`${API_URL}/api/payments/checkout`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ job_id: jobId, item_type: itemType, filename }),
+    body: JSON.stringify({ job_id: jobId, item_type: "song" }),
   });
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<{ checkout_session_id: string; checkout_url: string }>;
@@ -145,11 +146,11 @@ Production checklist for the frontend:
 2. Validate file extensions and display the backend size limit before upload.
 3. Disable the upload button while a job is processing.
 4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token. Make sure the frontend starts only one polling interval per job and clears it when the job reaches `done` or `error`.
-5. Show individual stem links and the ZIP link after `status === "done"`.
-6. If `PAYMENTS_ENABLED=true`, call `/api/payments/checkout` when the user clicks download and redirect them to the returned `checkout_url`.
+5. Show the 15-second vocal/instrumental preview after `status === "done"`.
+6. If `PAYMENTS_ENABLED=true`, call `/api/payments/checkout` when the user wants the full song and redirect them to the returned `checkout_url`.
 7. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
 
-You can add a Buy Me A Coffee advertisement/promotion directly in the HTML. No backend endpoint is required unless you want the ad placement or copy to be remotely configurable.
+No subscription, donation, or Buy Me A Coffee flow is required. The simple product is: free 15-second vocal/instrumental preview, then $3 per song for the full download.
 
 ## Deployment notes
 

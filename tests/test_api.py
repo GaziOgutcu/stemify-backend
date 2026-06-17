@@ -85,14 +85,14 @@ def test_payments_config_defaults_to_disabled():
 
     assert response.status_code == 200
     assert response.json()["enabled"] is False
-    assert response.json()["price_per_stem_cents"] == 300
+    assert response.json()["price_per_song_cents"] == 300
 
 
 def test_split_requires_authentication():
     response = client.post(
         "/api/split",
         files={"file": ("song.mp3", b"audio", "audio/mpeg")},
-        data={"stems": "4"},
+        data={"stems": "2"},
     )
 
     assert response.status_code == 401
@@ -103,19 +103,19 @@ def test_split_rejects_unsupported_stem_count():
     response = client.post(
         "/api/split",
         files={"file": ("song.mp3", b"audio", "audio/mpeg")},
-        data={"stems": "3"},
+        data={"stems": "4"},
         headers=auth_headers(),
     )
 
     assert response.status_code == 400
-    assert "Unsupported stem count" in response.json()["detail"]
+    assert "only supports 2 stems" in response.json()["detail"]
 
 
 def test_split_rejects_unsupported_file_type():
     response = client.post(
         "/api/split",
         files={"file": ("notes.txt", b"audio", "text/plain")},
-        data={"stems": "4"},
+        data={"stems": "2"},
         headers=auth_headers(),
     )
 
@@ -136,7 +136,7 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     response = client.post(
         "/api/split",
         files={"file": ("My Song!!!.mp3", b"audio", "audio/mpeg")},
-        data={"stems": "4"},
+        data={"stems": "2"},
         headers=headers,
     )
 
@@ -144,7 +144,8 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     payload = response.json()
     assert payload["status"] == "processing"
     assert payload["track_name"] == "My_Song___"
-    assert payload["user"]["stem_count"] == 4
+    assert payload["preview_duration_seconds"] == 15
+    assert payload["user"]["stem_count"] == 2
     assert payload["user"]["jobs_created"] == 1
     assert payload["job_id"] in main.JOBS
     client.delete(f"/api/cleanup/{payload['job_id']}", headers=headers)
@@ -204,7 +205,7 @@ def test_download_zip_requires_payment_when_enabled(tmp_path, monkeypatch):
         "job_id": job_id,
         "user_email": "tester@example.com",
         "status": "done",
-        "requested_stems": 4,
+        "requested_stems": 2,
     }
     zip_path = job_dir / "stemify_song.zip"
     with zipfile.ZipFile(zip_path, "w") as archive:
@@ -213,4 +214,4 @@ def test_download_zip_requires_payment_when_enabled(tmp_path, monkeypatch):
     response = client.get(f"/api/download/{job_id}/zip", headers=headers)
 
     assert response.status_code == 402
-    assert response.json()["detail"]["price_per_stem_cents"] == 300
+    assert response.json()["detail"]["price_per_song_cents"] == 300

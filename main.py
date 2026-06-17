@@ -33,7 +33,7 @@ else:
     except Exception as exc:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
-app = FastAPI(title="Stemify API", version="1.3.1")
+app = FastAPI(title="Stemify API", version="1.4.0")
 
 
 def _split_csv_env(name: str, default: str = "") -> list[str]:
@@ -64,7 +64,8 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
-PRICE_PER_STEM_CENTS = int(os.getenv("PRICE_PER_STEM_CENTS", "300"))
+PREVIEW_DURATION_SECONDS = int(os.getenv("PREVIEW_DURATION_SECONDS", "15"))
+PRICE_PER_SONG_CENTS = int(os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "300")))
 PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "false").lower() == "true"
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "usd").lower()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
@@ -82,8 +83,6 @@ SOCIAL_AUTH_PROVIDERS = {
 
 STEM_MODELS = {
     2: "htdemucs",
-    4: "htdemucs",
-    6: "htdemucs_6s",
 }
 
 # In-memory job store. This is intentionally simple for a single-instance API;
@@ -122,7 +121,7 @@ class AuthResponse(BaseModel):
 
 class CheckoutRequest(BaseModel):
     job_id: str
-    item_type: str = Field(pattern="^(zip|stem)$")
+    item_type: str = Field(default="song", pattern="^(song|zip|stem)$")
     filename: str | None = Field(default=None, max_length=120)
 
 
@@ -211,7 +210,7 @@ def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
 
 
 def payment_key(job_id: str, item_type: str, filename: str | None = None) -> str:
-    return f"{job_id}:{item_type}:{filename or 'all'}"
+    return f"{job_id}:song"
 
 
 def is_payment_required() -> bool:
@@ -223,14 +222,13 @@ def is_download_paid(job_id: str, user: dict[str, Any], item_type: str, filename
         return True
 
     key = payment_key(job_id, item_type, filename)
-    zip_key = payment_key(job_id, "zip")
     with PAYMENTS_LOCK:
         return any(
             payment
             for payment in PAYMENTS.values()
             if payment.get("user_email") == user["email"]
             and payment.get("status") == "paid"
-            and payment.get("payment_key") in {key, zip_key}
+            and payment.get("payment_key") == key
         )
 
 
@@ -242,7 +240,7 @@ def enforce_paid_download(job: dict[str, Any], user: dict[str, Any], item_type: 
         402,
         {
             "message": "Payment required before download.",
-            "price_per_stem_cents": PRICE_PER_STEM_CENTS,
+            "price_per_song_cents": PRICE_PER_SONG_CENTS,
             "currency": PAYMENT_CURRENCY,
             "checkout_endpoint": "/api/payments/checkout",
         },
@@ -266,11 +264,7 @@ def enforce_job_done(job: dict[str, Any]) -> None:
 
 
 def checkout_amount_for_job(job: dict[str, Any], item_type: str) -> tuple[int, str]:
-    if item_type == "stem":
-        return PRICE_PER_STEM_CENTS, "Stemify single stem download"
-
-    stem_count = max(len(job.get("stems") or []), int(job.get("requested_stems") or 1))
-    return PRICE_PER_STEM_CENTS * stem_count, f"Stemify ZIP download ({stem_count} stems)"
+    return PRICE_PER_SONG_CENTS, "Stemify full song download"
 
 
 def stripe_request(method: str, path: str, data: dict[str, str] | None = None) -> dict[str, Any]:
@@ -301,6 +295,31 @@ def json_loads(raw: bytes) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
+def create_preview_input(job_id: str, input_path: Path) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to create the 15-second preview.")
+
+    preview_path = UPLOAD_DIR / f"{job_id}_preview.wav"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-t",
+        str(PREVIEW_DURATION_SECONDS),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        str(preview_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        err = (proc.stderr or "") + (proc.stdout or "")
+        raise RuntimeError(f"Preview trimming failed: {err[-400:]}")
+    return preview_path
+
+
 @app.get("/api")
 async def root():
     return {
@@ -309,9 +328,10 @@ async def root():
         "version": app.version,
         "allowed_stems": sorted(STEM_MODELS),
         "max_file_size_mb": MAX_FILE_SIZE_MB,
+        "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
         "payments": {
             "enabled": PAYMENTS_ENABLED,
-            "price_per_stem_cents": PRICE_PER_STEM_CENTS,
+            "price_per_song_cents": PRICE_PER_SONG_CENTS,
             "currency": PAYMENT_CURRENCY,
         },
     }
@@ -379,7 +399,7 @@ async def payments_config():
     return {
         "enabled": PAYMENTS_ENABLED,
         "provider": "stripe" if PAYMENTS_ENABLED else None,
-        "price_per_stem_cents": PRICE_PER_STEM_CENTS,
+        "price_per_song_cents": PRICE_PER_SONG_CENTS,
         "currency": PAYMENT_CURRENCY,
     }
 
@@ -394,9 +414,7 @@ async def create_checkout_session(
 
     job = get_authorized_job(payload.job_id, user)
     enforce_job_done(job)
-    filename = payload.filename if payload.item_type == "stem" else None
-    if payload.item_type == "stem" and not filename:
-        raise HTTPException(400, "A stem filename is required for stem checkout.")
+    filename = None
 
     amount_cents, product_name = checkout_amount_for_job(job, payload.item_type)
     session = stripe_request(
@@ -461,11 +479,10 @@ async def confirm_checkout_session(
 async def split_audio(
     user: Annotated[dict[str, Any], Depends(current_user)],
     file: UploadFile = File(...),
-    stems: int = Form(4),
+    stems: int = Form(2),
 ):
     if stems not in STEM_MODELS:
-        allowed_stems = ", ".join(str(value) for value in sorted(STEM_MODELS))
-        raise HTTPException(400, f"Unsupported stem count: {stems}. Allowed values: {allowed_stems}.")
+        raise HTTPException(400, "Stemify only supports 2 stems: vocals and instrumental.")
 
     original_name = Path(file.filename or "").name
     suffix = Path(original_name).suffix.lower()
@@ -492,7 +509,7 @@ async def split_audio(
         JOBS[job_id] = {
             "job_id": job_id,
             "status": "processing",
-            "status_detail": "Queued for stem separation.",
+            "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
             "stems": [],
             "zip_url": None,
             "stem_urls": {},
@@ -500,6 +517,7 @@ async def split_audio(
             "track_name": safe_stem,
             "user_email": user["email"],
             "requested_stems": stems,
+            "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
             "started_at": now,
             "updated_at": now,
         }
@@ -518,22 +536,31 @@ async def split_audio(
         {
             "job_id": job_id,
             "status": "processing",
-            "status_detail": "Queued for stem separation.",
+            "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
             "track_name": safe_stem,
+            "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
             "user": public_user(user),
         }
     )
 
 
 def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_name: str) -> None:
+    preview_path: Path | None = None
     try:
+        update_job(job_id, status_detail=f"Creating {PREVIEW_DURATION_SECONDS}-second preview.")
+        preview_path = create_preview_input(job_id, input_path)
         model = STEM_MODELS[stems]
         cmd = [sys.executable, "-m", "demucs", "-n", model, "--out", str(job_dir)]
         if stems == 2:
             cmd += ["--two-stems", "vocals"]
-        cmd.append(str(input_path))
+        cmd.append(str(preview_path))
 
-        update_job(job_id, status_detail="Separating audio with Demucs. First runs can be slower while the model warms up.")
+        update_job(
+            job_id,
+            status_detail=(
+                f"Separating the {PREVIEW_DURATION_SECONDS}-second preview into vocals and instrumental."
+            ),
+        )
         print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DEMUCS_TIMEOUT_SECONDS)
         print(f"[JOB {job_id[:8]}] STDOUT:\n{proc.stdout[-2000:]}", flush=True)
@@ -543,16 +570,21 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
         if proc.returncode != 0:
             err = (proc.stderr or "") + (proc.stdout or "")
             print(f"[JOB {job_id[:8]}] FAILED:\n{err[-800:]}")
-            update_job(job_id, status="error", status_detail="Stem separation failed.", error=f"Demucs error: {err[-400:]}")
+            update_job(
+                job_id,
+                status="error",
+                status_detail="Preview stem separation failed.",
+                error=f"Demucs error: {err[-400:]}",
+            )
             return
 
-        update_job(job_id, status_detail="Finalizing stem files and ZIP download.")
+        update_job(job_id, status_detail="Finalizing preview stem files.")
         wavs = sorted(job_dir.rglob("*.wav"))
         if not wavs:
             update_job(
                 job_id,
                 status="error",
-                status_detail="Stem separation finished without producing WAV files.",
+                status_detail="Preview stem separation finished without producing WAV files.",
                 error="No output files produced.",
             )
             return
@@ -567,7 +599,7 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
         update_job(
             job_id,
             status="done",
-            status_detail="Stems are ready to download.",
+            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready.",
             stems=stem_names,
             zip_url=f"/api/download/{job_id}/zip",
             stem_urls=stem_urls,
@@ -578,14 +610,16 @@ def run_demucs(job_id: str, job_dir: Path, input_path: Path, stems: int, track_n
         update_job(
             job_id,
             status="error",
-            status_detail="Stem separation timed out.",
+            status_detail="Preview stem separation timed out.",
             error=f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds. Try a shorter track.",
         )
     except Exception as exc:
-        update_job(job_id, status="error", status_detail="Stem separation crashed.", error=str(exc))
+        update_job(job_id, status="error", status_detail="Preview stem separation crashed.", error=str(exc))
         print(f"[JOB {job_id[:8]}] Exception: {exc}")
     finally:
         input_path.unlink(missing_ok=True)
+        if preview_path:
+            preview_path.unlink(missing_ok=True)
 
 
 @app.get("/api/job/{job_id}")
