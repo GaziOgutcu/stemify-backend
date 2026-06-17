@@ -358,7 +358,7 @@ def test_demucs_command_uses_fast_defaults(tmp_path, monkeypatch):
     monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
     monkeypatch.setattr(main, "DEMUCS_SHIFTS", 0)
     monkeypatch.setattr(main, "DEMUCS_OVERLAP", 0.1)
-    monkeypatch.setattr(main, "DEMUCS_SEGMENT_SECONDS", 8.0)
+    monkeypatch.setattr(main, "DEMUCS_SEGMENT_SECONDS", 8)
     monkeypatch.setattr(main, "DEMUCS_JOBS", 0)
     monkeypatch.setattr(main, "DEMUCS_DEVICE", "")
 
@@ -367,7 +367,7 @@ def test_demucs_command_uses_fast_defaults(tmp_path, monkeypatch):
     assert cmd[cmd.index("-n") + 1] == "mdx_q"
     assert cmd[cmd.index("--shifts") + 1] == "0"
     assert cmd[cmd.index("--overlap") + 1] == "0.1"
-    assert cmd[cmd.index("--segment") + 1] == "8.0"
+    assert cmd[cmd.index("--segment") + 1] == "8"
     assert "--two-stems" in cmd
     assert "--jobs" not in cmd
 
