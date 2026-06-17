@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import re
 import secrets
@@ -21,6 +22,32 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+
+if importlib.util.find_spec("firebase_admin"):
+    import firebase_admin
+    from firebase_admin import auth as firebase_auth
+    from firebase_admin import credentials
+else:
+    class FirebaseAdminFallback:
+        _apps: dict[str, object] = {}
+
+        @staticmethod
+        def initialize_app(cred: object) -> None:
+            FirebaseAdminFallback._apps["default"] = cred
+
+    class FirebaseAuthFallback:
+        @staticmethod
+        def verify_id_token(id_token: str) -> dict[str, Any]:
+            raise RuntimeError("firebase-admin is not installed.")
+
+    class FirebaseCredentialsFallback:
+        @staticmethod
+        def Certificate(data: dict[str, str]) -> dict[str, str]:
+            return data
+
+    firebase_admin = FirebaseAdminFallback()
+    firebase_auth = FirebaseAuthFallback()
+    credentials = FirebaseCredentialsFallback()
 
 # Auto-configure ffmpeg. Prefer a system ffmpeg when available, and do not let
 # static-ffmpeg download/network failures prevent the API from starting.
@@ -70,16 +97,9 @@ PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "false").lower() == "true"
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "usd").lower()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
-SOCIAL_AUTH_PROVIDERS = {
-    "google": {
-        "display_name": "Google",
-        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
-    },
-    "apple": {
-        "display_name": "Apple",
-        "client_id": os.getenv("APPLE_CLIENT_ID", ""),
-    },
-}
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
+FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
+FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
 
 STEM_MODELS = {
     2: "htdemucs",
@@ -182,6 +202,104 @@ def current_user(authorization: Annotated[str | None, Header()] = None) -> dict[
         raise HTTPException(401, "Invalid or expired token.")
     return user
 
+# Simple in-memory user/job stores. Firebase verifies identity; these dicts only
+# keep lightweight per-user usage counts for the current single-instance API.
+USERS: dict[str, dict[str, Any]] = {}
+AUTH_LOCK = threading.Lock()
+PAYMENTS: dict[str, dict[str, Any]] = {}
+PAYMENTS_LOCK = threading.Lock()
+
+
+class UserProfile(BaseModel):
+    uid: str
+    email: str
+    name: str | None = None
+    provider: str
+
+
+class CheckoutRequest(BaseModel):
+    job_id: str
+    item_type: str = Field(default="song", pattern="^(song|zip|stem)$")
+    filename: str | None = Field(default=None, max_length=120)
+
+
+class ConfirmPaymentRequest(BaseModel):
+    checkout_session_id: str
+
+
+def initialize_firebase() -> None:
+    if firebase_admin._apps:
+        return
+    if not (FIREBASE_PROJECT_ID and FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY):
+        return
+
+    cred = credentials.Certificate(
+        {
+            "type": "service_account",
+            "project_id": FIREBASE_PROJECT_ID,
+            "private_key": FIREBASE_PRIVATE_KEY,
+            "client_email": FIREBASE_CLIENT_EMAIL,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    )
+    firebase_admin.initialize_app(cred)
+
+
+initialize_firebase()
+
+
+def public_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "uid": user["uid"],
+        "email": user["email"],
+        "name": user.get("name"),
+        "provider": user["provider"],
+    }
+
+
+def usage_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {**public_user(user), "stem_count": user["stem_count"], "jobs_created": user["jobs_created"]}
+
+
+def current_user(authorization: Annotated[str | None, Header()] = None) -> dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Authentication required.")
+    if not firebase_admin._apps:
+        raise HTTPException(503, "Firebase authentication is not configured.")
+
+    id_token = authorization.removeprefix("Bearer ").strip()
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception as exc:
+        raise HTTPException(401, "Invalid or expired Firebase token.") from exc
+
+    uid = decoded.get("uid")
+    email = decoded.get("email")
+    if not uid or not email:
+        raise HTTPException(401, "Firebase token is missing required user details.")
+
+    provider = (decoded.get("firebase") or {}).get("sign_in_provider", "firebase")
+    with AUTH_LOCK:
+        user = USERS.setdefault(
+            uid,
+            {
+                "uid": uid,
+                "email": email,
+                "name": decoded.get("name"),
+                "provider": provider,
+                "stem_count": 0,
+                "jobs_created": 0,
+            },
+        )
+        user.update(
+            {
+                "email": email,
+                "name": decoded.get("name"),
+                "provider": provider,
+            }
+        )
+        return user
+
 
 def update_job(job_id: str, **values: Any) -> None:
     with JOBS_LOCK:
@@ -204,7 +322,7 @@ def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
         job = JOBS.get(job_id)
         if not job:
             raise HTTPException(404, "Job not found")
-        if job.get("user_email") != user["email"]:
+        if job.get("user_uid") != user["uid"]:
             raise HTTPException(404, "Job not found")
         return serialize_job(job)
 
@@ -226,7 +344,7 @@ def is_download_paid(job_id: str, user: dict[str, Any], item_type: str, filename
         return any(
             payment
             for payment in PAYMENTS.values()
-            if payment.get("user_email") == user["email"]
+            if payment.get("user_uid") == user["uid"]
             and payment.get("status") == "paid"
             and payment.get("payment_key") == key
         )
@@ -347,51 +465,9 @@ async def health():
     }
 
 
-@app.post("/api/auth/signup", response_model=AuthResponse)
-async def signup(payload: AuthRequest):
-    email = normalize_email(payload.email)
-    with AUTH_LOCK:
-        if email in USERS:
-            raise HTTPException(409, "An account already exists for this email.")
-        USERS[email] = {
-            "email": email,
-            "password_hash": hash_password(payload.password),
-            "stem_count": 0,
-            "jobs_created": 0,
-        }
-        user = USERS[email]
-    return create_auth_response(user)
-
-
-@app.post("/api/auth/signin", response_model=AuthResponse)
-async def signin(payload: AuthRequest):
-    email = normalize_email(payload.email)
-    with AUTH_LOCK:
-        user = USERS.get(email)
-    if not user or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(401, "Invalid email or password.")
-    return create_auth_response(user)
-
-
 @app.get("/api/me", response_model=UserProfile)
 async def me(user: Annotated[dict[str, Any], Depends(current_user)]):
     return UserProfile(**public_user(user))
-
-
-@app.get("/api/auth/social/providers")
-async def social_auth_providers():
-    return {
-        "providers": [
-            {
-                "provider": provider,
-                "display_name": details["display_name"],
-                "enabled": bool(details["client_id"]),
-                "client_id": details["client_id"] or None,
-            }
-            for provider, details in SOCIAL_AUTH_PROVIDERS.items()
-        ],
-        "note": "Use the provider SDK on the frontend, then add a backend token-verification callback before production.",
-    }
 
 
 @app.get("/api/payments/config")
@@ -432,6 +508,7 @@ async def create_checkout_session(
             "metadata[job_id]": payload.job_id,
             "metadata[item_type]": payload.item_type,
             "metadata[filename]": filename or "",
+            "metadata[user_uid]": user["uid"],
             "metadata[user_email]": user["email"],
         },
     )
@@ -443,6 +520,7 @@ async def create_checkout_session(
             "job_id": payload.job_id,
             "item_type": payload.item_type,
             "filename": filename,
+            "user_uid": user["uid"],
             "user_email": user["email"],
             "status": "pending",
             "amount_cents": amount_cents,
@@ -462,7 +540,7 @@ async def confirm_checkout_session(
 
     with PAYMENTS_LOCK:
         payment = PAYMENTS.get(payload.checkout_session_id)
-    if not payment or payment.get("user_email") != user["email"]:
+    if not payment or payment.get("user_uid") != user["uid"]:
         raise HTTPException(404, "Payment not found.")
 
     session = stripe_request("GET", f"/checkout/sessions/{urllib.parse.quote(payload.checkout_session_id)}")
@@ -515,6 +593,7 @@ async def split_audio(
             "stem_urls": {},
             "error": None,
             "track_name": safe_stem,
+            "user_uid": user["uid"],
             "user_email": user["email"],
             "requested_stems": stems,
             "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
@@ -539,7 +618,7 @@ async def split_audio(
             "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
             "track_name": safe_stem,
             "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
-            "user": public_user(user),
+            "user": usage_user(user),
         }
     )
 

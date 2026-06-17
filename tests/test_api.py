@@ -7,6 +7,41 @@ from fastapi.testclient import TestClient
 
 
 client = TestClient(main.app)
+FIREBASE_TOKENS = {}
+
+
+@pytest.fixture(autouse=True)
+def reset_auth_state(monkeypatch):
+    main.USERS.clear()
+    main.JOBS.clear()
+    main.PAYMENTS.clear()
+    FIREBASE_TOKENS.clear()
+
+    main.firebase_admin._apps["test"] = object()
+
+    def fake_verify_id_token(token):
+        if token not in FIREBASE_TOKENS:
+            raise ValueError("bad token")
+        return FIREBASE_TOKENS[token]
+
+    monkeypatch.setattr(main.firebase_auth, "verify_id_token", fake_verify_id_token)
+    yield
+    main.USERS.clear()
+    main.JOBS.clear()
+    main.PAYMENTS.clear()
+    FIREBASE_TOKENS.clear()
+    main.firebase_admin._apps.pop("test", None)
+
+
+def auth_headers(uid="test-uid", email="tester@example.com", name="Test User"):
+    token = f"token-{uid}"
+    FIREBASE_TOKENS[token] = {
+        "uid": uid,
+        "email": email,
+        "name": name,
+        "firebase": {"sign_in_provider": "google.com"},
+    }
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture(autouse=True)
@@ -39,45 +74,16 @@ def test_health_includes_runtime_details():
     assert "output_dir" in payload
 
 
-def test_signup_creates_account_and_token():
-    response = client.post(
-        "/api/auth/signup",
-        json={"email": "NewUser@Example.com", "password": "password123"},
-    )
+def test_me_returns_firebase_user_profile():
+    response = client.get("/api/me", headers=auth_headers())
 
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["token"]
-    assert payload["user"] == {
-        "email": "newuser@example.com",
-        "stem_count": 0,
-        "jobs_created": 0,
+    assert response.json() == {
+        "uid": "test-uid",
+        "email": "tester@example.com",
+        "name": "Test User",
+        "provider": "google.com",
     }
-
-
-def test_signin_rejects_bad_password():
-    client.post("/api/auth/signup", json={"email": "tester@example.com", "password": "password123"})
-
-    response = client.post(
-        "/api/auth/signin",
-        json={"email": "tester@example.com", "password": "wrongpass"},
-    )
-
-    assert response.status_code == 401
-    assert "Invalid email or password" in response.json()["detail"]
-
-
-def test_social_auth_providers_show_configured_options(monkeypatch):
-    monkeypatch.setitem(main.SOCIAL_AUTH_PROVIDERS["google"], "client_id", "google-client")
-    monkeypatch.setitem(main.SOCIAL_AUTH_PROVIDERS["apple"], "client_id", "")
-
-    response = client.get("/api/auth/social/providers")
-
-    assert response.status_code == 200
-    providers = {provider["provider"]: provider for provider in response.json()["providers"]}
-    assert providers["google"]["enabled"] is True
-    assert providers["google"]["client_id"] == "google-client"
-    assert providers["apple"]["enabled"] is False
 
 
 def test_payments_config_defaults_to_disabled():
@@ -163,7 +169,7 @@ def test_download_zip_returns_ready_archive(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     job_dir = tmp_path / job_id
     job_dir.mkdir()
-    main.JOBS[job_id] = {"job_id": job_id, "user_email": "tester@example.com", "status": "done"}
+    main.JOBS[job_id] = {"job_id": job_id, "user_uid": "test-uid", "status": "done"}
     zip_path = job_dir / "stemify_song.zip"
     with zipfile.ZipFile(zip_path, "w") as archive:
         archive.writestr("vocals.wav", b"wav")
@@ -182,7 +188,7 @@ def test_download_zip_reports_not_ready_for_processing_job(tmp_path, monkeypatch
     job_dir.mkdir()
     main.JOBS[job_id] = {
         "job_id": job_id,
-        "user_email": "tester@example.com",
+        "user_uid": "test-uid",
         "status": "processing",
         "status_detail": "Separating audio with Demucs.",
         "started_at": 100.0,
@@ -203,7 +209,7 @@ def test_download_zip_requires_payment_when_enabled(tmp_path, monkeypatch):
     job_dir.mkdir()
     main.JOBS[job_id] = {
         "job_id": job_id,
-        "user_email": "tester@example.com",
+        "user_uid": "test-uid",
         "status": "done",
         "requested_stems": 2,
     }

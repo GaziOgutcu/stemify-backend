@@ -6,10 +6,7 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
 
 - `GET /api` - service metadata and configured limits.
 - `GET /api/health` - health check for deployments.
-- `POST /api/auth/signup` - create an account with `email` and `password`, returning a bearer token and user stem totals.
-- `POST /api/auth/signin` - sign in with `email` and `password`, returning a bearer token and user stem totals.
-- `GET /api/auth/social/providers` - list social sign-in providers configured for the frontend, such as Google or Apple.
-- `GET /api/me` - return the signed-in user's profile and stem usage totals.
+- `GET /api/me` - return the signed-in Firebase user's `uid`, `email`, `name`, and `provider`.
 - `GET /api/payments/config` - return paid-download settings such as price per song and currency.
 - `POST /api/payments/checkout` - create a Stripe Checkout session for a full-song download when paid downloads are enabled.
 - `POST /api/payments/confirm` - confirm a Stripe Checkout session before allowing paid downloads.
@@ -21,11 +18,9 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
 - `GET /api/download/{job_id}/stem/{filename}` - download one WAV stem.
 - `DELETE /api/cleanup/{job_id}` - remove output files and forget the job.
 
-All split, job status, payment checkout/confirm, download, cleanup, and profile endpoints require an `Authorization: Bearer <token>` header from sign up or sign in. Each submitted split job is tied to that signed-in user, and the API increments the user's `jobs_created` and `stem_count` totals when the job is accepted.
+All split, job status, payment checkout/confirm, download, cleanup, and profile endpoints require an `Authorization: Bearer <firebase_id_token>` header from Firebase Google Sign-In. Each submitted split job is tied to that signed-in Firebase user.
 
 Job status responses include `status_detail`, `elapsed_seconds`, and `timeout_seconds` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the preview job status is `done`.
-
-Social sign in is not fully automatic from the backend alone. The frontend still needs Google/Apple buttons and provider SDKs, plus production token verification on the backend. `GET /api/auth/social/providers` exposes which providers are configured so the HTML can show or hide those buttons.
 
 ## Local setup
 
@@ -53,39 +48,27 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `PAYMENT_CURRENCY` | `usd` | Currency for Stripe Checkout. |
 | `STRIPE_SECRET_KEY` | empty | Stripe secret key used to create and confirm Checkout sessions. |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
-| `GOOGLE_CLIENT_ID` | empty | Enables Google as a social sign-in option in `/api/auth/social/providers`. |
-| `APPLE_CLIENT_ID` | empty | Enables Apple as a social sign-in option in `/api/auth/social/providers`. |
+| `FIREBASE_PROJECT_ID` | empty | Firebase project ID used by Firebase Admin SDK. |
+| `FIREBASE_CLIENT_EMAIL` | empty | Firebase service account client email. |
+| `FIREBASE_PRIVATE_KEY` | empty | Firebase service account private key. Store this in Railway, not in code. |
 
 ## Frontend integration guide
 
 Set a frontend environment variable such as `NEXT_PUBLIC_API_URL=https://your-backend.up.railway.app`.
 
-Example flow:
+Example flow after the static frontend signs in with Firebase Google Sign-In:
 
 ```ts
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-export async function signUp(email: string, password: string) {
-  const response = await fetch(`${API_URL}/api/auth/signup`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json() as Promise<{
-    token: string;
-    user: { email: string; stem_count: number; jobs_created: number };
-  }>;
-}
-
-export async function splitTrack(file: File, token: string) {
+export async function splitTrack(file: File, firebaseIdToken: string) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("stems", "2");
 
   const upload = await fetch(`${API_URL}/api/split`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${firebaseIdToken}` },
     body: formData,
   });
   if (!upload.ok) throw new Error(await upload.text());
@@ -95,7 +78,7 @@ export async function splitTrack(file: File, token: string) {
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
     const statusResponse = await fetch(`${API_URL}/api/job/${job_id}`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${firebaseIdToken}` },
     });
     if (!statusResponse.ok) throw new Error(await statusResponse.text());
 
@@ -113,25 +96,12 @@ export async function splitTrack(file: File, token: string) {
   }
 }
 
-export async function getSocialProviders() {
-  const response = await fetch(`${API_URL}/api/auth/social/providers`);
-  if (!response.ok) throw new Error(await response.text());
-  return response.json() as Promise<{
-    providers: Array<{
-      provider: "google" | "apple";
-      display_name: string;
-      enabled: boolean;
-      client_id: string | null;
-    }>;
-  }>;
-}
-
-export async function createDownloadCheckout(token: string, jobId: string) {
+export async function createDownloadCheckout(firebaseIdToken: string, jobId: string) {
   const response = await fetch(`${API_URL}/api/payments/checkout`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${firebaseIdToken}`,
     },
     body: JSON.stringify({ job_id: jobId, item_type: "song" }),
   });
@@ -142,7 +112,7 @@ export async function createDownloadCheckout(token: string, jobId: string) {
 
 Production checklist for the frontend:
 
-1. Require sign up/sign in before enabling uploads, then store the returned bearer token securely for API calls.
+1. Require Firebase Google Sign-In before enabling uploads, then call `user.getIdToken()` and send it as `Authorization: Bearer <firebase_id_token>`.
 2. Validate file extensions and display the backend size limit before upload.
 3. Disable the upload button while a job is processing.
 4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token. Make sure the frontend starts only one polling interval per job and clears it when the job reaches `done` or `error`.
@@ -150,7 +120,7 @@ Production checklist for the frontend:
 6. If `PAYMENTS_ENABLED=true`, call `/api/payments/checkout` when the user wants the full song and redirect them to the returned `checkout_url`.
 7. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
 
-No subscription, donation, or Buy Me A Coffee flow is required. The simple product is: free 15-second vocal/instrumental preview, then $3 per song for the full download.
+The simple product is: free 15-second vocal/instrumental preview, then $3 per song for the full download.
 
 ## Deployment notes
 
@@ -160,4 +130,4 @@ The included Dockerfile installs FFmpeg and Demucs. Railway should use `railway.
 ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
 ```
 
-The current auth, token, user stem totals, and job stores are in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so accounts, sessions, and stem counts survive restarts and work across multiple backend instances.
+Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
