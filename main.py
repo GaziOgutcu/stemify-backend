@@ -105,10 +105,14 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
+DEMUCS_MODEL = os.getenv("DEMUCS_MODEL", os.getenv("DEMUCS_MODEL_2_STEMS", "mdx_q"))
 DEMUCS_SHIFTS = int(os.getenv("DEMUCS_SHIFTS", "0"))
 DEMUCS_OVERLAP = float(os.getenv("DEMUCS_OVERLAP", "0.1"))
+DEMUCS_SEGMENT_SECONDS = float(os.getenv("DEMUCS_SEGMENT_SECONDS", "8"))
 DEMUCS_JOBS = int(os.getenv("DEMUCS_JOBS", "0"))
 DEMUCS_DEVICE = os.getenv("DEMUCS_DEVICE", "")
+DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
+DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 OUTPUT_FORMATS = {
     "wav": {
@@ -154,8 +158,9 @@ FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
 
 STEM_MODELS = {
-    2: "htdemucs",
+    2: DEMUCS_MODEL,
 }
+DEMUCS_SEMAPHORE = threading.Semaphore(DEMUCS_CONCURRENCY)
 
 # In-memory job store. This is intentionally simple for a single-instance API;
 # use Redis/Postgres if you scale to multiple workers or need durable history.
@@ -529,10 +534,14 @@ async def root():
         "output_formats": sorted(OUTPUT_FORMATS),
         "default_output_format": "wav",
         "performance": {
+            "demucs_model": DEMUCS_MODEL,
             "demucs_shifts": DEMUCS_SHIFTS,
             "demucs_overlap": DEMUCS_OVERLAP,
+            "demucs_segment_seconds": DEMUCS_SEGMENT_SECONDS,
             "demucs_jobs": DEMUCS_JOBS,
             "demucs_device": DEMUCS_DEVICE or "auto",
+            "demucs_cpu_threads": DEMUCS_CPU_THREADS,
+            "demucs_concurrency": DEMUCS_CONCURRENCY,
         },
         "payments": {
             "enabled": PAYMENTS_ENABLED,
@@ -824,6 +833,43 @@ async def split_audio(
     )
 
 
+def build_demucs_command(job_dir: Path, preview_path: Path, stems: int) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "demucs",
+        "-n",
+        STEM_MODELS[stems],
+        "--out",
+        str(job_dir),
+        "--shifts",
+        str(DEMUCS_SHIFTS),
+        "--overlap",
+        str(DEMUCS_OVERLAP),
+    ]
+    if DEMUCS_SEGMENT_SECONDS > 0:
+        cmd += ["--segment", str(DEMUCS_SEGMENT_SECONDS)]
+    if DEMUCS_JOBS > 0:
+        cmd += ["--jobs", str(DEMUCS_JOBS)]
+    if DEMUCS_DEVICE:
+        cmd += ["--device", DEMUCS_DEVICE]
+    if stems == 2:
+        cmd += ["--two-stems", "vocals"]
+    cmd.append(str(preview_path))
+    return cmd
+
+
+def demucs_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if DEMUCS_CPU_THREADS > 0:
+        thread_count = str(DEMUCS_CPU_THREADS)
+        env["OMP_NUM_THREADS"] = thread_count
+        env["MKL_NUM_THREADS"] = thread_count
+        env["NUMEXPR_NUM_THREADS"] = thread_count
+        env["TORCH_NUM_THREADS"] = thread_count
+    return env
+
+
 def run_demucs(
     job_id: str,
     job_dir: Path,
@@ -838,38 +884,30 @@ def run_demucs(
             job_id, status_detail=f"Creating {PREVIEW_DURATION_SECONDS}-second preview."
         )
         preview_path = create_preview_input(job_id, input_path)
-        model = STEM_MODELS[stems]
-        cmd = [
-            sys.executable,
-            "-m",
-            "demucs",
-            "-n",
-            model,
-            "--out",
-            str(job_dir),
-            "--shifts",
-            str(DEMUCS_SHIFTS),
-            "--overlap",
-            str(DEMUCS_OVERLAP),
-        ]
-        if DEMUCS_JOBS > 0:
-            cmd += ["--jobs", str(DEMUCS_JOBS)]
-        if DEMUCS_DEVICE:
-            cmd += ["--device", DEMUCS_DEVICE]
-        if stems == 2:
-            cmd += ["--two-stems", "vocals"]
-        cmd.append(str(preview_path))
+        cmd = build_demucs_command(job_dir, preview_path, stems)
+        env = demucs_subprocess_env()
 
         update_job(
             job_id,
             status_detail=(
-                f"Separating the {PREVIEW_DURATION_SECONDS}-second preview into vocals and instrumental."
+                f"Waiting for an available Demucs worker for the {PREVIEW_DURATION_SECONDS}-second preview."
             ),
         )
-        print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=DEMUCS_TIMEOUT_SECONDS
-        )
+        with DEMUCS_SEMAPHORE:
+            update_job(
+                job_id,
+                status_detail=(
+                    f"Separating the {PREVIEW_DURATION_SECONDS}-second preview with {STEM_MODELS[stems]}."
+                ),
+            )
+            print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=DEMUCS_TIMEOUT_SECONDS,
+                env=env,
+            )
         print(f"[JOB {job_id[:8]}] STDOUT:\n{proc.stdout[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] STDERR:\n{proc.stderr[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] RETURN CODE: {proc.returncode}", flush=True)

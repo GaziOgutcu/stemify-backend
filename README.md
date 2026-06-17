@@ -42,10 +42,14 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `ALLOWED_ORIGINS` | `*` | Comma-separated frontend origins. Set this to your Vercel/local frontend URLs in production. |
 | `MAX_FILE_SIZE_MB` | `50` | Upload size limit. |
 | `DEMUCS_TIMEOUT_SECONDS` | `900` | Maximum processing time per job. |
+| `DEMUCS_MODEL` | `mdx_q` | Demucs model used for 2-stem vocal/instrumental previews. `mdx_q` is much faster on CPU than `htdemucs`; set `htdemucs` only if quality matters more than speed. |
 | `DEMUCS_SHIFTS` | `0` | Demucs test-time shifts. `0` is fastest; raise only if you prefer quality over speed. |
 | `DEMUCS_OVERLAP` | `0.1` | Demucs split overlap. Lower values are faster. |
-| `DEMUCS_JOBS` | `0` | Optional Demucs worker count; `0` leaves the default behavior. |
+| `DEMUCS_SEGMENT_SECONDS` | `8` | Smaller Demucs processing chunks reduce memory pressure and usually improve CPU stability on small Railway containers. |
+| `DEMUCS_JOBS` | `0` | Optional Demucs worker count; keep `0` for one preview at a time unless you have spare CPU/RAM. |
 | `DEMUCS_DEVICE` | empty | Optional Demucs device override such as `cuda` or `cpu`. |
+| `DEMUCS_CPU_THREADS` | `2` | CPU threads exposed to Torch/BLAS in the Demucs subprocess. Tune to your Railway CPU allocation. |
+| `DEMUCS_CONCURRENCY` | `1` | Maximum concurrent Demucs subprocesses. Keep at `1` on CPU Railway deployments to avoid multiple jobs slowing each other down or exhausting memory. |
 | `UPLOAD_DIR` | `uploads` | Temporary upload directory. |
 | `OUTPUT_DIR` | `outputs` | Generated stems directory. |
 | `PREVIEW_DURATION_SECONDS` | `15` | Free preview length to split into vocals and instrumental. |
@@ -140,4 +144,4 @@ The included Dockerfile installs FFmpeg and Demucs. Railway should use `railway.
 ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
 ```
 
-For speed, the backend now runs Demucs with no test-time shifts by default and low overlap; set `DEMUCS_DEVICE=cuda` on GPU infrastructure for much faster processing. Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
+For speed, the backend now runs the quantized `mdx_q` Demucs model, no test-time shifts, low overlap, bounded segment size, one Demucs worker at a time, and explicit Torch/BLAS CPU thread limits by default. Set `DEMUCS_DEVICE=cuda` on GPU infrastructure for much faster processing, or set `DEMUCS_MODEL=htdemucs` if quality matters more than CPU speed. Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
