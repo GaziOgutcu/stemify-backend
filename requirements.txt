@@ -1,10 +1,5 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
-demucs==4.0.1
-torch>=2.0.0
-torchaudio>=2.0.0
 static-ffmpeg>=2.5
-torchcodec
 firebase-admin>=6.5.0
-diffq>=0.2.1

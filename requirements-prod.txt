@@ -1,0 +1,7 @@
+-r requirements.txt
+
+demucs==4.0.1
+torch>=2.0.0
+torchaudio>=2.0.0
+torchcodec
+diffq>=0.2.1
