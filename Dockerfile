@@ -5,7 +5,9 @@ RUN apt-get update && apt-get install -y ffmpeg git build-essential && rm -rf /v
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-prod.txt .
+
+RUN pip install --no-cache-dir -r requirements-prod.txt
 
 # Pre-download models at build time so they're cached in the image
 RUN python -c "from demucs.pretrained import get_model; get_model('htdemucs')" || true
