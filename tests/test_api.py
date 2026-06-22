@@ -532,6 +532,32 @@ def test_demucs_command_uses_fast_defaults(tmp_path, monkeypatch):
     assert "--jobs" not in cmd
 
 
+def test_demucs_command_uses_high_quality_settings(tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        main.QUALITY_SETTINGS,
+        "high",
+        {
+            "models": {2: "htdemucs"},
+            "shifts": 2,
+            "overlap": 0.5,
+            "segment_seconds": 0,
+            "jobs": 1,
+            "device": "cuda",
+        },
+    )
+
+    cmd = main.build_demucs_command(
+        tmp_path / "out", tmp_path / "preview.wav", 2, "high"
+    )
+
+    assert cmd[cmd.index("-n") + 1] == "htdemucs"
+    assert cmd[cmd.index("--shifts") + 1] == "2"
+    assert cmd[cmd.index("--overlap") + 1] == "0.5"
+    assert "--segment" not in cmd
+    assert cmd[cmd.index("--jobs") + 1] == "1"
+    assert cmd[cmd.index("--device") + 1] == "cuda"
+
+
 def test_demucs_subprocess_env_limits_cpu_threads(monkeypatch):
     monkeypatch.setattr(main, "DEMUCS_CPU_THREADS", 3)
 
@@ -683,6 +709,18 @@ def test_split_rejects_unsupported_output_format():
     assert "Unsupported output format" in response.json()["detail"]
 
 
+def test_split_rejects_unsupported_quality():
+    response = client.post(
+        "/api/split",
+        files={"file": ("song.mp3", b"audio", "audio/mpeg")},
+        data={"stems": "2", "quality": "ultra"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert "Unsupported quality" in response.json()["detail"]
+
+
 def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     def fake_thread(*, target, args, daemon):
         class DummyThread:
@@ -696,7 +734,7 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     response = client.post(
         "/api/split",
         files={"file": ("My Song!!!.mp3", b"audio", "audio/mpeg")},
-        data={"stems": "2", "output_format": "mp3"},
+        data={"stems": "2", "output_format": "mp3", "quality": "high"},
         headers=headers,
     )
 
@@ -706,7 +744,11 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     assert payload["track_name"] == "My_Song___"
     assert payload["preview_duration_seconds"] == 15
     assert payload["output_format"] == "mp3"
+    assert payload["quality"] == "high"
     assert "wav" in payload["available_output_formats"]
+    assert "fast" in payload["available_qualities"]
+    assert main.JOBS[payload["job_id"]]["output_format"] == "mp3"
+    assert main.JOBS[payload["job_id"]]["quality"] == "high"
     assert payload["user"]["stem_count"] == 2
     assert payload["user"]["jobs_created"] == 1
     assert payload["job_id"] in main.JOBS
