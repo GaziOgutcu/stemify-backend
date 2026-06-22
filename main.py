@@ -110,8 +110,10 @@ app.add_middleware(
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
+JOBS_DIR = Path(os.getenv("JOBS_DIR", "jobs"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -216,6 +218,46 @@ AUTH_LOCK = threading.Lock()
 PAYMENTS: dict[str, dict[str, Any]] = {}
 USER_PAYMENT_JOBS: dict[str, set[str]] = {}
 PAYMENTS_LOCK = threading.Lock()
+PAID_ASSET_EVENTS: dict[str, threading.Event] = {}
+PAID_ASSET_LOCK = threading.Lock()
+
+
+def job_dir_for(job_id: str) -> Path:
+    return JOBS_DIR / job_id
+
+
+def job_json_path(job_id: str) -> Path:
+    return job_dir_for(job_id) / "job.json"
+
+
+def write_job_json(job: dict[str, Any]) -> None:
+    job_id = job["job_id"]
+    path = job_json_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(job, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def load_job_json(job_id: str) -> dict[str, Any]:
+    path = job_json_path(job_id)
+    if not path.is_file():
+        raise HTTPException(404, "Job not found")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(500, "Job metadata is corrupted.") from exc
+
+
+def find_job_by_checkout_session(checkout_session_id: str) -> dict[str, Any] | None:
+    for path in JOBS_DIR.glob("*/job.json"):
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if job.get("checkout_session_id") == checkout_session_id:
+            return job
+    return None
 
 
 class UserProfile(BaseModel):
@@ -318,10 +360,18 @@ def current_user(
 
 
 def update_job(job_id: str, **values: Any) -> None:
+    job_for_disk = None
     with JOBS_LOCK:
         if job_id in JOBS:
             values.setdefault("updated_at", time.time())
             JOBS[job_id].update(values)
+            job_for_disk = JOBS[job_id].copy()
+    if job_for_disk is None and job_json_path(job_id).is_file():
+        job_for_disk = load_job_json(job_id)
+        values.setdefault("updated_at", time.time())
+        job_for_disk.update(values)
+    if job_for_disk is not None:
+        write_job_json(job_for_disk)
 
 
 def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -334,16 +384,22 @@ def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(404, "Job not found")
-        if job.get("user_uid") != user["uid"]:
-            raise HTTPException(404, "Job not found")
-        return serialize_job(job)
+    if job_json_path(job_id).is_file():
+        job = load_job_json(job_id)
+    else:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise HTTPException(404, "Job not found")
+            job = job.copy()
+    if job.get("user_uid") != user["uid"]:
+        raise HTTPException(404, "Job not found")
+    return serialize_job(job)
 
 
 def get_public_job(job_id: str) -> dict[str, Any]:
+    if job_json_path(job_id).is_file():
+        return serialize_job(load_job_json(job_id))
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
@@ -426,6 +482,11 @@ def enforce_paid_download(
     item_type: str,
     filename: str | None = None,
 ) -> None:
+    if (
+        job.get("payment_status") == "paid"
+        and job.get("full_processing_status") == "ready"
+    ):
+        return
     if is_download_paid(job["job_id"], user, item_type, filename):
         return
 
@@ -629,7 +690,8 @@ def prepare_output_files(
         )
 
     format_config = OUTPUT_FORMATS[output_format]
-    converted_dir = OUTPUT_DIR / job_id / output_scope / output_format
+    base_dir = job_dir_for(job_id) if job_dir_for(job_id).exists() else OUTPUT_DIR / job_id
+    converted_dir = base_dir / output_scope / output_format
     converted_dir.mkdir(parents=True, exist_ok=True)
     converted_files: list[Path] = []
 
@@ -880,6 +942,7 @@ async def health():
         "ffmpeg_available": shutil.which("ffmpeg") is not None,
         "upload_dir": str(UPLOAD_DIR),
         "output_dir": str(OUTPUT_DIR),
+        "jobs_dir": str(JOBS_DIR),
         "output_formats": sorted(OUTPUT_FORMATS),
         "qualities": sorted(QUALITY_SETTINGS),
     }
@@ -910,7 +973,15 @@ async def create_checkout_session(
     validate_checkout_configuration()
 
     job = get_authorized_job(payload.job_id, user)
-    enforce_job_done(job)
+    if job.get("preview_status") != "ready" and job.get("status") != "done":
+        raise HTTPException(
+            409,
+            {
+                "message": "Preview stems are not ready yet.",
+                "preview_status": job.get("preview_status"),
+                "status_detail": job.get("status_detail"),
+            },
+        )
     filename = None
 
     amount_cents, product_name = checkout_amount_for_job(job, payload.item_type)
@@ -968,6 +1039,11 @@ async def create_checkout_session(
             "currency": PAYMENT_CURRENCY,
         }
         USER_PAYMENT_JOBS.setdefault(user["uid"], set()).add(payload.job_id)
+    update_job(
+        payload.job_id,
+        checkout_session_id=session["id"],
+        payment_status="pending",
+    )
 
     return {"checkout_session_id": session["id"], "checkout_url": session.get("url")}
 
@@ -1039,17 +1115,236 @@ def mark_checkout_session_paid(
         if verification_source == "api":
             payment["stripe_api_verified"] = True
         USER_PAYMENT_JOBS.setdefault(user_uid, set()).add(job_id)
+    paid_job_updates = {
+        "paid": True,
+        "payment_status": "paid",
+        "paid_checkout_session_id": session_id,
+        "checkout_session_id": session_id,
+        "stripe_payment_intent": session.get("payment_intent"),
+        "updated_at": time.time(),
+    }
+    should_start_paid_assets = False
     with JOBS_LOCK:
         if job_id in JOBS and JOBS[job_id].get("user_uid") == user_uid:
-            JOBS[job_id].update(
-                {
-                    "paid": True,
-                    "payment_status": "paid",
-                    "paid_checkout_session_id": session_id,
-                    "updated_at": time.time(),
-                }
+            JOBS[job_id].update(paid_job_updates)
+            should_start_paid_assets = not JOBS[job_id].get("zip_url")
+    if job_json_path(job_id).is_file():
+        disk_job = load_job_json(job_id)
+        if disk_job.get("user_uid") == user_uid:
+            should_start_paid_assets = should_start_paid_assets or not disk_job.get(
+                "zip_url"
             )
+            update_job(job_id, **paid_job_updates)
+    if should_start_paid_assets:
+        start_paid_assets_generation(job_id)
+    with PAYMENTS_LOCK:
         return payment.copy()
+
+
+def start_paid_assets_generation(job_id: str) -> None:
+    with PAID_ASSET_LOCK:
+        if job_id in PAID_ASSET_EVENTS:
+            return
+        PAID_ASSET_EVENTS[job_id] = threading.Event()
+
+    thread = threading.Thread(
+        target=_paid_assets_worker,
+        args=(job_id,),
+        daemon=True,
+    )
+    thread.start()
+
+
+def _paid_assets_worker(job_id: str) -> None:
+    try:
+        ensure_paid_assets_ready(job_id, owns_processing=True)
+    except Exception as exc:
+        audio_logger.exception(
+            "Paid full stem generation failed job_id=%s error=%s", job_id, exc
+        )
+
+
+def ensure_paid_assets_ready(
+    job_id: str, owns_processing: bool = False
+) -> dict[str, Any]:
+    job = get_public_job(job_id)
+    if job.get("zip_url"):
+        return job
+    if job.get("payment_status") != "paid":
+        raise HTTPException(402, "Payment required before full processing.")
+
+    if owns_processing:
+        with PAID_ASSET_LOCK:
+            event = PAID_ASSET_EVENTS.get(job_id)
+            if event is None:
+                event = threading.Event()
+                PAID_ASSET_EVENTS[job_id] = event
+    else:
+        with PAID_ASSET_LOCK:
+            event = PAID_ASSET_EVENTS.get(job_id)
+            if event is None:
+                event = threading.Event()
+                PAID_ASSET_EVENTS[job_id] = event
+                owns_processing = True
+
+    if not owns_processing:
+        event.wait(timeout=DEMUCS_TIMEOUT_SECONDS + 120)
+        job = get_public_job(job_id)
+        if job.get("zip_url"):
+            return job
+        raise HTTPException(
+            409,
+            {
+                "message": "Full stems are still processing after payment verification.",
+                "status": job.get("status"),
+                "status_detail": job.get("status_detail"),
+                "full_processing_status": job.get("full_processing_status"),
+            },
+        )
+
+    try:
+        lock_path = job_dir_for(job_id) / "full_processing.lock"
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            owns_lock = True
+        except FileExistsError:
+            owns_lock = False
+        if not owns_lock:
+            deadline = time.time() + DEMUCS_TIMEOUT_SECONDS
+            while time.time() < deadline:
+                time.sleep(1)
+                latest_job = get_public_job(job_id)
+                if latest_job.get("full_processing_status") == "ready" and latest_job.get(
+                    "zip_path"
+                ):
+                    return latest_job
+                if latest_job.get("full_processing_status") == "error":
+                    raise HTTPException(500, latest_job.get("error") or "Full processing failed.")
+            raise HTTPException(409, "Full stems are still processing.")
+
+        original_input_path = job.get("original_input_path")
+        if not original_input_path:
+            raise HTTPException(
+                409, "Original upload is not available for full processing."
+            )
+
+        input_path = Path(original_input_path)
+        if not input_path.is_file():
+            raise HTTPException(410, "Original upload is no longer available.")
+
+        job_dir = job_dir_for(job_id)
+        stems = int(job.get("requested_stems") or 2)
+        track_name = job.get("track_name") or "track"
+        output_format = job.get("output_format") or DEFAULT_OUTPUT_FORMAT
+        quality = normalize_quality(job.get("quality") or DEFAULT_QUALITY)
+        source_duration = job.get("source_duration_seconds")
+
+        update_job(
+            job_id,
+            status_detail=f"Payment verified. Separating the full track with {demucs_model_for_quality(stems, quality)} ({quality} quality).",
+            full_processing_status="processing",
+        )
+        full_cmd = build_demucs_command(job_dir, input_path, stems, quality)
+        env = demucs_subprocess_env()
+        full_demucs_dir = demucs_output_dir(job_dir, input_path, stems, quality)
+        audio_logger.info(
+            "Prepared paid full Demucs job job_id=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
+            job_id,
+            " ".join(full_cmd),
+            full_demucs_dir,
+            input_path,
+            input_path.stat().st_size,
+        )
+        with DEMUCS_SEMAPHORE:
+            proc = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=DEMUCS_TIMEOUT_SECONDS,
+                env=env,
+            )
+        print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
+
+        if proc.returncode != 0:
+            err = (proc.stderr or "") + (proc.stdout or "")
+            update_job(
+                job_id,
+                status_detail="Full stem separation failed after payment verification.",
+                full_processing_status="error",
+                full_processing_error=f"Demucs error: {err[-400:]}",
+            )
+            raise HTTPException(500, "Full stem separation failed.")
+
+        full_wavs = expected_demucs_stem_files(job_dir, input_path, stems, quality)
+        missing_full_wavs = [path for path in full_wavs if not path.is_file()]
+        if missing_full_wavs:
+            update_job(
+                job_id,
+                status_detail="Full stem separation finished without the expected stem files.",
+                full_processing_status="error",
+                full_processing_error=(
+                    "Missing Demucs output files: "
+                    + ", ".join(str(path) for path in missing_full_wavs)
+                ),
+            )
+            raise HTTPException(500, "Full stem separation did not create all stems.")
+        validate_audio_files(full_wavs, "Demucs full stem")
+
+        full_output_files = prepare_output_files(
+            job_id, full_wavs, output_format, "full"
+        )
+        if full_output_files != full_wavs:
+            validate_audio_files(full_output_files, "Paid full stem")
+        full_dir = job_dir / "full"
+        full_dir.mkdir(parents=True, exist_ok=True)
+        persisted_full_files: list[Path] = []
+        for full_output_file in full_output_files:
+            persisted_file = full_dir / full_output_file.name
+            if full_output_file != persisted_file:
+                shutil.copy2(full_output_file, persisted_file)
+            persisted_full_files.append(persisted_file)
+        full_output_files = persisted_full_files
+        for full_stem_file in full_output_files:
+            validate_paid_download_file(
+                full_stem_file,
+                {"source_duration_seconds": source_duration},
+                "Paid full stem",
+            )
+
+        zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
+        create_zip(zip_path, full_output_files)
+        reject_preview_paid_path(zip_path)
+
+        download_stem_urls = {
+            public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
+            for stem_file in full_output_files
+        }
+        full_stem_paths_by_name = output_files_by_public_name(full_output_files)
+        update_job(
+            job_id,
+            status="done",
+            status_detail="Payment verified. Full paid stems and ZIP are ready.",
+            full_processing_status="ready",
+            full_stems=download_stem_urls,
+            zip_url=f"/api/download/{job_id}/zip",
+            full_stem_paths=path_map_for_job(full_stem_paths_by_name),
+            download_stem_urls=download_stem_urls,
+            download_urls={
+                "zip": f"/api/download/{job_id}/zip",
+                "stems": download_stem_urls,
+            },
+            zip_path=str(zip_path),
+        )
+        return get_public_job(job_id)
+    finally:
+        if "owns_lock" in locals() and owns_lock:
+            lock_path.unlink(missing_ok=True)
+        event.set()
+        with PAID_ASSET_LOCK:
+            PAID_ASSET_EVENTS.pop(job_id, None)
 
 
 def payment_verification_response(
@@ -1063,7 +1358,9 @@ def payment_verification_response(
         "payment_status": payment.get("status", "pending"),
     }
     if payment.get("status") == "paid":
-        job = get_authorized_job(payment["job_id"], user)
+        job = ensure_paid_assets_ready(payment["job_id"])
+        if job.get("user_uid") != user["uid"]:
+            raise HTTPException(404, "Job not found")
         response.update(
             {
                 "zip_url": job.get("zip_url"),
@@ -1213,35 +1510,50 @@ async def split_audio(
         raise HTTPException(400, "Uploaded file is empty.")
 
     job_id = str(uuid.uuid4())
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id)
     job_dir.mkdir(parents=True, exist_ok=False)
+    input_dir = job_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
 
     safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(original_name).stem)[:80] or "track"
-    input_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    input_path = input_dir / original_name
     input_path.write_bytes(contents)
     now = time.time()
 
+    job_record = {
+        "job_id": job_id,
+        "original_filename": original_name,
+        "uploaded_file_path": str(input_path),
+        "preview_status": "processing",
+        "preview_stems": [],
+        "payment_status": "pending",
+        "checkout_session_id": None,
+        "stripe_payment_intent": None,
+        "full_processing_status": "not_started",
+        "full_stems": [],
+        "zip_path": None,
+        "error": None,
+        "created_at": now,
+        "updated_at": now,
+        "status": "processing",
+        "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
+        "stems": [],
+        "zip_url": None,
+        "stem_urls": {},
+        "track_name": safe_stem,
+        "user_uid": user["uid"],
+        "user_email": user["email"],
+        "requested_stems": stems,
+        "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
+        "output_format": output_format,
+        "quality": quality,
+        "started_at": now,
+        "paid": False,
+        "original_input_path": str(input_path),
+    }
+    write_job_json(job_record)
     with JOBS_LOCK:
-        JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "processing",
-            "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
-            "stems": [],
-            "zip_url": None,
-            "stem_urls": {},
-            "error": None,
-            "track_name": safe_stem,
-            "user_uid": user["uid"],
-            "user_email": user["email"],
-            "requested_stems": stems,
-            "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
-            "output_format": output_format,
-            "quality": quality,
-            "started_at": now,
-            "updated_at": now,
-            "payment_status": "pending",
-            "paid": False,
-        }
+        JOBS[job_id] = job_record.copy()
     with AUTH_LOCK:
         user["jobs_created"] += 1
         user["stem_count"] += stems
@@ -1379,9 +1691,10 @@ def run_demucs(
             print(f"[JOB {job_id[:8]}] FAILED:\n{err[-800:]}")
             update_job(
                 job_id,
-                status="error",
-                status_detail="Preview stem separation failed.",
-                error=f"Demucs error: {err[-400:]}",
+            status="error",
+            preview_status="error",
+            status_detail="Preview stem separation failed.",
+            error=f"Demucs error: {err[-400:]}",
             )
             return
 
@@ -1401,6 +1714,7 @@ def run_demucs(
             update_job(
                 job_id,
                 status="error",
+                preview_status="error",
                 status_detail="Preview stem separation finished without the expected stem files.",
                 error=(
                     "Missing Demucs output files: "
@@ -1421,110 +1735,37 @@ def run_demucs(
             {path.name: path.stat().st_size for path in preview_output_files},
         )
 
-        update_job(
-            job_id,
-            status_detail=f"Separating the full track with {demucs_model_for_quality(stems, quality)} ({quality} quality).",
-        )
-        full_cmd = build_demucs_command(job_dir, input_path, stems, quality)
-        full_demucs_dir = demucs_output_dir(job_dir, input_path, stems, quality)
-        audio_logger.info(
-            "Prepared full Demucs job job_id=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
-            job_id,
-            " ".join(full_cmd),
-            full_demucs_dir,
-            input_path,
-            input_path.stat().st_size,
-        )
-        with DEMUCS_SEMAPHORE:
-            proc = subprocess.run(
-                full_cmd,
-                capture_output=True,
-                text=True,
-                timeout=DEMUCS_TIMEOUT_SECONDS,
-                env=env,
-            )
-        print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
-        print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
-        print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
-
-        if proc.returncode != 0:
-            err = (proc.stderr or "") + (proc.stdout or "")
-            update_job(
-                job_id,
-                status="error",
-                status_detail="Full stem separation failed.",
-                error=f"Demucs error: {err[-400:]}",
-            )
-            return
-
-        full_wavs = expected_demucs_stem_files(job_dir, input_path, stems, quality)
-        missing_full_wavs = [path for path in full_wavs if not path.is_file()]
-        if missing_full_wavs:
-            update_job(
-                job_id,
-                status="error",
-                status_detail="Full stem separation finished without the expected stem files.",
-                error=(
-                    "Missing Demucs output files: "
-                    + ", ".join(str(path) for path in missing_full_wavs)
-                ),
-            )
-            return
-        validate_audio_files(full_wavs, "Demucs full stem")
-
-        full_output_files = prepare_output_files(
-            job_id, full_wavs, output_format, "full"
-        )
-        validate_audio_files(full_output_files, "Paid full stem")
-        for full_stem_file in full_output_files:
-            validate_paid_download_file(
-                full_stem_file,
-                {"source_duration_seconds": source_duration},
-                "Paid full stem",
-            )
-
-        zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
-        create_zip(zip_path, full_output_files)
-        reject_preview_paid_path(zip_path)
-
         stem_names = [public_stem_name(stem_file) for stem_file in preview_output_files]
         preview_urls = {
             public_stem_name(stem_file): f"/api/preview/{job_id}/stem/{stem_file.name}"
             for stem_file in preview_output_files
         }
-        download_stem_urls = {
-            public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
-            for stem_file in full_output_files
-        }
-        full_stem_paths_by_name = output_files_by_public_name(full_output_files)
         update_job(
             job_id,
             status="done",
-            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview and full paid stems are ready.",
+            preview_status="ready",
+            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready. Complete payment to generate full stems and ZIP.",
             stems=stem_names,
-            zip_url=f"/api/download/{job_id}/zip",
+            preview_stems=preview_urls,
+            zip_url=None,
             stem_urls=preview_urls,
             preview_urls=preview_urls,
             preview_stem_paths=path_map_for_job(
                 output_files_by_public_name(preview_output_files)
             ),
-            full_stem_paths=path_map_for_job(full_stem_paths_by_name),
-            download_stem_urls=download_stem_urls,
-            download_urls={
-                "zip": f"/api/download/{job_id}/zip",
-                "stems": download_stem_urls,
-            },
-            zip_path=str(zip_path),
+            download_stem_urls={},
+            download_urls={"zip": None, "stems": {}},
             source_duration_seconds=source_duration,
             output_format=output_format,
             quality=quality,
         )
-        print(f"[JOB {job_id[:8]}] Done: {stem_names}")
+        print(f"[JOB {job_id[:8]}] Preview done: {stem_names}")
 
     except subprocess.TimeoutExpired:
         update_job(
             job_id,
             status="error",
+            preview_status="error",
             status_detail="Preview stem separation timed out.",
             error=f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds. Try a shorter track.",
         )
@@ -1532,12 +1773,12 @@ def run_demucs(
         update_job(
             job_id,
             status="error",
+            preview_status="error",
             status_detail="Preview stem separation crashed.",
             error=str(exc),
         )
         print(f"[JOB {job_id[:8]}] Exception: {exc}")
     finally:
-        input_path.unlink(missing_ok=True)
         if preview_path:
             preview_path.unlink(missing_ok=True)
 
@@ -1560,7 +1801,7 @@ async def preview_stem(job_id: str, filename: str):
     if f"/api/preview/{job_id}/stem/{filename}" not in preview_urls.values():
         raise HTTPException(404, "Preview stem not found.")
 
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
@@ -1595,7 +1836,7 @@ async def download_zip(
     job = get_authorized_job(job_id, user)
     enforce_job_done(job)
     enforce_paid_download(job, user, "zip")
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
     zip_path = Path(job["zip_path"]) if job.get("zip_path") else None
@@ -1620,7 +1861,7 @@ async def download_stem(
     job = get_authorized_job(job_id, user)
     enforce_job_done(job)
     enforce_paid_download(job, user, "stem", filename)
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
