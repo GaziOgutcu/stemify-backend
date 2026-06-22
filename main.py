@@ -742,6 +742,12 @@ def convert_preview_wavs_to_mp3(
 
     for wav in wavs:
         converted = converted_dir / f"{wav.stem}.mp3"
+        audio_logger.info(
+            "Converting preview WAV to MP3 with ffmpeg job_id=%s input_wav_path=%s output_mp3_path=%s",
+            job_id,
+            wav,
+            converted,
+        )
         cmd = [
             ffmpeg,
             "-y",
@@ -774,17 +780,19 @@ def convert_preview_wavs_to_mp3(
         public_name = public_stem_name(converted)
         preview_metadata[public_name] = {
             "path": str(converted),
+            "input_wav_path": str(wav),
             "size_bytes": size,
             "duration_seconds": duration,
             "ffmpeg_return_code": proc.returncode,
         }
         audio_logger.info(
-            "Preview MP3 export job_id=%s path=%s size_bytes=%s duration_seconds=%.3f ffmpeg_return_code=%s",
+            "Preview MP3 export job_id=%s input_wav_path=%s output_mp3_path=%s ffmpeg_return_code=%s ffprobe_duration=%.3f output_file_size_bytes=%s",
             job_id,
+            wav,
             converted,
-            size,
-            duration,
             proc.returncode,
+            duration,
+            size,
         )
         if validation_error:
             raise RuntimeError(validation_error)
@@ -1876,7 +1884,28 @@ def run_demucs(
 async def job_status(
     job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
 ):
-    return JSONResponse(get_authorized_job(job_id, user))
+    job = get_authorized_job(job_id, user)
+    preview_file_info = job.get("preview_file_info") or {}
+    preview_stem_paths = job.get("preview_stem_paths") or {}
+    return JSONResponse(
+        {
+            **job,
+            "preview_debug": {
+                "mp3_paths": {
+                    name: info.get("path")
+                    for name, info in preview_file_info.items()
+                    if isinstance(info, dict)
+                }
+                or preview_stem_paths,
+                "durations_seconds": job.get("preview_durations_seconds") or {},
+                "sizes_bytes": {
+                    name: info.get("size_bytes")
+                    for name, info in preview_file_info.items()
+                    if isinstance(info, dict)
+                },
+            },
+        }
+    )
 
 
 @app.get("/api/preview/{job_id}/stem/{filename}")

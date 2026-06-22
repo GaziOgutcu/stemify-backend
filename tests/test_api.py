@@ -810,11 +810,13 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(
         stderr = ""
 
     demucs_calls = []
+    ffmpeg_calls = []
 
     def fake_run(cmd, *args, **kwargs):
         if cmd[0] == sys.executable:
             demucs_calls.append(cmd)
         else:
+            ffmpeg_calls.append(cmd)
             Path(cmd[-1]).write_bytes(b"mp3" * 500)
         return FakeProc()
 
@@ -830,10 +832,25 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(
         "instrumental": f"/api/preview/{job_id}/stem/no_vocals.mp3",
         "vocals": f"/api/preview/{job_id}/stem/vocals.mp3",
     }
+    assert main.JOBS[job_id]["preview_status"] == "ready"
+    assert all(
+        url.endswith(".mp3") for url in main.JOBS[job_id]["preview_stems"].values()
+    )
+    assert not any(
+        url.endswith(".wav") for url in main.JOBS[job_id]["preview_stems"].values()
+    )
     assert main.JOBS[job_id]["preview_durations_seconds"] == {
         "instrumental": 12.5,
         "vocals": 12.5,
     }
+    assert all(
+        duration > 0
+        for duration in main.JOBS[job_id]["preview_durations_seconds"].values()
+    )
+    assert all(
+        info["size_bytes"] > 0
+        for info in main.JOBS[job_id]["preview_file_info"].values()
+    )
     assert main.JOBS[job_id]["download_stem_urls"] == {}
     assert main.JOBS[job_id]["download_urls"] == {"zip": None, "stems": {}}
     assert main.JOBS[job_id]["zip_url"] is None
@@ -843,6 +860,9 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(
     assert "full_stem_paths" not in main.JOBS[job_id]
     assert input_path.exists()
     assert len(demucs_calls) == 1
+    assert len(ffmpeg_calls) == 2
+    assert all(call[0] == "/usr/bin/ffmpeg" for call in ffmpeg_calls)
+    assert all(call[-1].endswith(".mp3") for call in ffmpeg_calls)
     assert str(preview_path) in demucs_calls[0]
     assert str(input_path) not in demucs_calls[0]
 
@@ -948,14 +968,39 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
 def test_job_status_survives_cleared_memory_cache():
     headers = auth_headers()
     job_id = "disk-backed-job"
-    write_test_job(job_id, status_detail="Preview ready from disk.")
+    mp3_path = str(main.job_dir_for(job_id) / "preview" / "mp3" / "vocals.mp3")
+    write_test_job(
+        job_id,
+        status_detail="Preview ready from disk.",
+        preview_stems={"vocals": f"/api/preview/{job_id}/stem/vocals.mp3"},
+        preview_urls={"vocals": f"/api/preview/{job_id}/stem/vocals.mp3"},
+        stem_urls={"vocals": f"/api/preview/{job_id}/stem/vocals.mp3"},
+        preview_durations_seconds={"vocals": 12.5},
+        preview_file_info={
+            "vocals": {
+                "path": mp3_path,
+                "input_wav_path": "/tmp/vocals.wav",
+                "size_bytes": 1234,
+                "duration_seconds": 12.5,
+                "ffmpeg_return_code": 0,
+            }
+        },
+        preview_stem_paths={"vocals": mp3_path},
+    )
     main.JOBS.clear()
 
     response = client.get(f"/api/job/{job_id}", headers=headers)
 
     assert response.status_code == 200
-    assert response.json()["job_id"] == job_id
-    assert response.json()["preview_status"] == "ready"
+    payload = response.json()
+    assert payload["job_id"] == job_id
+    assert payload["preview_status"] == "ready"
+    assert payload["preview_stems"]["vocals"].endswith(".mp3")
+    assert payload["preview_durations_seconds"]["vocals"] > 0
+    assert payload["preview_file_info"]["vocals"]["size_bytes"] > 0
+    assert payload["preview_debug"]["mp3_paths"]["vocals"].endswith(".mp3")
+    assert payload["preview_debug"]["durations_seconds"]["vocals"] > 0
+    assert payload["preview_debug"]["sizes_bytes"]["vocals"] > 0
 
 
 def test_checkout_uses_disk_job_after_memory_cache_clear(monkeypatch):
