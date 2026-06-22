@@ -131,6 +131,9 @@ DEMUCS_HIGH_DEVICE = os.getenv("DEMUCS_HIGH_DEVICE", DEMUCS_DEVICE)
 DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
 DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
+DEFAULT_OUTPUT_FORMAT = "mp3"
+DEFAULT_QUALITY = "fast"
+
 OUTPUT_FORMATS = {
     "wav": {
         "extension": ".wav",
@@ -658,7 +661,7 @@ def prepare_output_files(
 
 
 def normalize_quality(quality: str | None) -> str:
-    normalized = (quality or "fast").strip().lower()
+    normalized = (quality or DEFAULT_QUALITY).strip().lower()
     if normalized not in QUALITY_SETTINGS:
         raise HTTPException(
             400,
@@ -809,9 +812,9 @@ async def root():
         "max_file_size_mb": MAX_FILE_SIZE_MB,
         "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
         "output_formats": sorted(OUTPUT_FORMATS),
-        "default_output_format": "wav",
+        "default_output_format": DEFAULT_OUTPUT_FORMAT,
         "qualities": sorted(QUALITY_SETTINGS),
-        "default_quality": "fast",
+        "default_quality": DEFAULT_QUALITY,
         "performance": {
             "demucs_model": DEMUCS_MODEL,
             "demucs_shifts": DEMUCS_SHIFTS,
@@ -1136,8 +1139,8 @@ async def split_audio(
     user: Annotated[dict[str, Any], Depends(current_user)],
     file: UploadFile = File(...),
     stems: int = Form(2),
-    output_format: str = Form("wav"),
-    quality: str = Form("fast"),
+    output_format: str = Form(DEFAULT_OUTPUT_FORMAT),
+    quality: str = Form(DEFAULT_QUALITY),
 ):
     if stems not in STEM_MODELS:
         raise HTTPException(
