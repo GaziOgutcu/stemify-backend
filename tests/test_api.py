@@ -481,6 +481,58 @@ def test_demucs_subprocess_env_limits_cpu_threads(monkeypatch):
     assert env["TORCH_NUM_THREADS"] == "3"
 
 
+def test_expected_demucs_stems_use_model_preview_output_dir(tmp_path, monkeypatch):
+    monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
+    preview_path = tmp_path / "job-preview.wav"
+
+    stems = main.expected_demucs_stem_files(tmp_path / "out", preview_path, 2)
+
+    assert stems == [
+        tmp_path / "out" / "mdx_q" / "job-preview" / "vocals.wav",
+        tmp_path / "out" / "mdx_q" / "job-preview" / "no_vocals.wav",
+    ]
+
+
+def test_validate_audio_file_rejects_silent_audio(tmp_path, monkeypatch):
+    stem = tmp_path / "vocals.wav"
+    stem.write_bytes(b"0" * 2048)
+    monkeypatch.setattr(main, "audio_duration_seconds", lambda path: 15.0)
+    monkeypatch.setattr(main, "audio_rms_db", lambda path: None)
+
+    with pytest.raises(RuntimeError, match="appears to be silent"):
+        main.validate_audio_file(stem, "Demucs preview stem")
+
+
+def test_run_demucs_fails_when_expected_stems_are_missing(tmp_path, monkeypatch):
+    job_id = "missing-stems-job"
+    job_dir = tmp_path / job_id
+    job_dir.mkdir()
+    input_path = tmp_path / "input.mp3"
+    input_path.write_bytes(b"audio")
+    preview_path = tmp_path / f"{job_id}_preview.wav"
+    preview_path.write_bytes(b"preview" * 400)
+    main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
+
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
+    monkeypatch.setattr(
+        main, "create_preview_input", lambda job_id, input_path: preview_path
+    )
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: FakeProc())
+
+    main.run_demucs(job_id, job_dir, input_path, 2, "song", "wav")
+
+    assert main.JOBS[job_id]["status"] == "error"
+    assert "expected stem files" in main.JOBS[job_id]["status_detail"]
+    assert "vocals.wav" in main.JOBS[job_id]["error"]
+
+
 def test_split_requires_authentication():
     response = client.post(
         "/api/split",

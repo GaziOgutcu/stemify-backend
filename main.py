@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
-import static_ffmpeg
 from fastapi import (
     Depends,
     FastAPI,
@@ -33,6 +32,11 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+
+if importlib.util.find_spec("static_ffmpeg"):
+    import static_ffmpeg
+else:
+    static_ffmpeg = None
 
 if importlib.util.find_spec("firebase_admin"):
     import firebase_admin
@@ -67,13 +71,20 @@ if shutil.which("ffmpeg"):
     print("[OK] ffmpeg ready")
 else:
     try:
-        static_ffmpeg.add_paths()
-        print("[OK] ffmpeg ready")
+        if static_ffmpeg:
+            static_ffmpeg.add_paths()
+            print("[OK] ffmpeg ready")
+        else:
+            print(
+                "[WARN] static-ffmpeg is not installed and system ffmpeg was not found"
+            )
     except Exception as exc:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
 app = FastAPI(title="Stemify API", version="1.5.0")
-logger = logging.getLogger("stemify.stripe")
+stripe_logger = logging.getLogger("stemify.stripe")
+audio_logger = logging.getLogger("stemify.audio")
+logger = stripe_logger
 
 
 def _split_csv_env(name: str, default: str = "") -> list[str]:
@@ -142,6 +153,8 @@ OUTPUT_FORMATS = {
     },
 }
 PREVIEW_DURATION_SECONDS = int(os.getenv("PREVIEW_DURATION_SECONDS", "15"))
+MIN_STEM_FILE_SIZE_BYTES = int(os.getenv("MIN_STEM_FILE_SIZE_BYTES", "1024"))
+SILENCE_RMS_DB_THRESHOLD = float(os.getenv("SILENCE_RMS_DB_THRESHOLD", "-90"))
 PRICE_PER_SONG_CENTS = int(
     os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "300"))
 )
@@ -505,6 +518,13 @@ def create_preview_input(job_id: str, input_path: Path) -> Path:
     if proc.returncode != 0:
         err = (proc.stderr or "") + (proc.stdout or "")
         raise RuntimeError(f"Preview trimming failed: {err[-400:]}")
+    audio_logger.info(
+        "Created preview input job_id=%s input_path=%s preview_path=%s preview_size_bytes=%s",
+        job_id,
+        input_path,
+        preview_path,
+        preview_path.stat().st_size if preview_path.exists() else 0,
+    )
     return preview_path
 
 
@@ -540,9 +560,136 @@ def prepare_output_files(
         if proc.returncode != 0:
             err = (proc.stderr or "") + (proc.stdout or "")
             raise RuntimeError(f"{output_format.upper()} export failed: {err[-400:]}")
+        validate_audio_file(converted, f"{output_format.upper()} preview stem")
+        audio_logger.info(
+            "Generated encoded preview stem job_id=%s path=%s size_bytes=%s",
+            job_id,
+            converted,
+            converted.stat().st_size,
+        )
         converted_files.append(converted)
 
     return converted_files
+
+
+def demucs_output_dir(job_dir: Path, preview_path: Path, stems: int) -> Path:
+    return job_dir / STEM_MODELS[stems] / preview_path.stem
+
+
+def expected_demucs_stem_files(
+    job_dir: Path, preview_path: Path, stems: int
+) -> list[Path]:
+    output_dir = demucs_output_dir(job_dir, preview_path, stems)
+    if stems == 2:
+        return [output_dir / "vocals.wav", output_dir / "no_vocals.wav"]
+    return sorted(output_dir.glob("*.wav"))
+
+
+def audio_duration_seconds(path: Path) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("FFprobe is required to validate generated audio.")
+
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or "") + (proc.stdout or "")
+        raise RuntimeError(
+            f"Could not read audio duration for {path.name}: {err[-300:]}"
+        )
+    try:
+        return float(proc.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid audio duration for {path.name}: {proc.stdout!r}"
+        ) from exc
+
+
+def audio_rms_db(path: Path) -> float | None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to validate generated audio.")
+
+    proc = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(path),
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or "") + (proc.stdout or "")
+        raise RuntimeError(
+            f"Could not analyze audio levels for {path.name}: {err[-300:]}"
+        )
+
+    output = (proc.stderr or "") + (proc.stdout or "")
+    match = re.search(r"mean_volume:\s*(-?inf|-?\d+(?:\.\d+)?) dB", output)
+    if not match:
+        raise RuntimeError(f"Could not find audio level metadata for {path.name}.")
+    if match.group(1) == "-inf":
+        return None
+    return float(match.group(1))
+
+
+def validate_audio_file(path: Path, label: str) -> dict[str, float | int | None]:
+    if not path.is_file():
+        raise RuntimeError(f"{label} was not created: {path}")
+
+    size = path.stat().st_size
+    if size < MIN_STEM_FILE_SIZE_BYTES:
+        raise RuntimeError(
+            f"{label} is too small to be valid audio ({size} bytes): {path}"
+        )
+
+    duration = audio_duration_seconds(path)
+    if duration <= 0:
+        raise RuntimeError(f"{label} has no playable duration: {path}")
+
+    rms_db = audio_rms_db(path)
+    if rms_db is None or rms_db <= SILENCE_RMS_DB_THRESHOLD:
+        level = "-inf" if rms_db is None else f"{rms_db:.1f} dB"
+        raise RuntimeError(
+            f"{label} appears to be silent (mean volume {level}): {path}"
+        )
+
+    audio_logger.info(
+        "Validated %s path=%s size_bytes=%s duration_seconds=%.3f mean_volume_db=%.1f",
+        label,
+        path,
+        size,
+        duration,
+        rms_db,
+    )
+    return {"size_bytes": size, "duration_seconds": duration, "mean_volume_db": rms_db}
+
+
+def validate_audio_files(paths: list[Path], label: str) -> None:
+    for path in paths:
+        validate_audio_file(path, f"{label} {path.name}")
 
 
 @app.get("/api")
@@ -1009,9 +1156,21 @@ def run_demucs(
         update_job(
             job_id, status_detail=f"Creating {PREVIEW_DURATION_SECONDS}-second preview."
         )
+        audio_logger.info(
+            "Starting preview split job_id=%s input_path=%s", job_id, input_path
+        )
         preview_path = create_preview_input(job_id, input_path)
         cmd = build_demucs_command(job_dir, preview_path, stems)
         env = demucs_subprocess_env()
+        demucs_dir = demucs_output_dir(job_dir, preview_path, stems)
+        audio_logger.info(
+            "Prepared Demucs job job_id=%s command=%s output_dir=%s preview_path=%s preview_size_bytes=%s",
+            job_id,
+            " ".join(cmd),
+            demucs_dir,
+            preview_path,
+            preview_path.stat().st_size,
+        )
 
         update_job(
             job_id,
@@ -1053,17 +1212,35 @@ def run_demucs(
             job_id,
             status_detail=f"Finalizing preview stem files as {output_format.upper()}.",
         )
-        wavs = sorted(job_dir.rglob("*.wav"))
-        if not wavs:
+        wavs = expected_demucs_stem_files(job_dir, preview_path, stems)
+        audio_logger.info(
+            "Checking Demucs output job_id=%s output_dir=%s generated_stems=%s",
+            job_id,
+            demucs_dir,
+            [str(path) for path in wavs],
+        )
+        missing_wavs = [path for path in wavs if not path.is_file()]
+        if missing_wavs:
             update_job(
                 job_id,
                 status="error",
-                status_detail="Preview stem separation finished without producing WAV files.",
-                error="No output files produced.",
+                status_detail="Preview stem separation finished without the expected stem files.",
+                error=(
+                    "Missing Demucs output files: "
+                    + ", ".join(str(path) for path in missing_wavs)
+                ),
             )
             return
+        validate_audio_files(wavs, "Demucs preview stem")
 
         output_files = prepare_output_files(job_id, wavs, output_format)
+        validate_audio_files(output_files, "Browser preview stem")
+        audio_logger.info(
+            "Prepared browser preview stems job_id=%s preview_files=%s file_sizes=%s",
+            job_id,
+            [str(path) for path in output_files],
+            {path.name: path.stat().st_size for path in output_files},
+        )
         zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for stem_file in output_files:
