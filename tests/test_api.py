@@ -533,6 +533,47 @@ def test_run_demucs_fails_when_expected_stems_are_missing(tmp_path, monkeypatch)
     assert "vocals.wav" in main.JOBS[job_id]["error"]
 
 
+def test_run_demucs_publishes_free_preview_urls(tmp_path, monkeypatch):
+    job_id = "preview-url-job"
+    job_dir = tmp_path / job_id
+    input_path = tmp_path / "input.mp3"
+    input_path.write_bytes(b"audio")
+    preview_path = tmp_path / f"{job_id}_preview.wav"
+    preview_path.write_bytes(b"preview" * 400)
+    demucs_dir = job_dir / "mdx_q" / preview_path.stem
+    demucs_dir.mkdir(parents=True)
+    (demucs_dir / "vocals.wav").write_bytes(b"v" * 2048)
+    (demucs_dir / "no_vocals.wav").write_bytes(b"i" * 2048)
+    main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
+
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
+    monkeypatch.setattr(
+        main, "create_preview_input", lambda job_id, input_path: preview_path
+    )
+    monkeypatch.setattr(main, "validate_audio_files", lambda paths, label: None)
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: FakeProc())
+
+    main.run_demucs(job_id, job_dir, input_path, 2, "song", "wav")
+
+    assert main.JOBS[job_id]["status"] == "done"
+    assert main.JOBS[job_id]["stems"] == ["vocals", "instrumental"]
+    assert main.JOBS[job_id]["stem_urls"] == {
+        "instrumental": f"/api/preview/{job_id}/stem/no_vocals.wav",
+        "vocals": f"/api/preview/{job_id}/stem/vocals.wav",
+    }
+    assert main.JOBS[job_id]["download_stem_urls"] == {
+        "instrumental": f"/api/download/{job_id}/stem/no_vocals.wav",
+        "vocals": f"/api/download/{job_id}/stem/vocals.wav",
+    }
+
+
 def test_split_requires_authentication():
     response = client.post(
         "/api/split",
@@ -616,6 +657,29 @@ def test_download_stem_rejects_invalid_filename():
     )
 
     assert response.status_code in {400, 404}
+
+
+def test_preview_stem_is_served_without_auth_or_payment(tmp_path, monkeypatch):
+    job_id = "free-preview-test"
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    job_dir = tmp_path / job_id / "mdx_q" / "preview"
+    job_dir.mkdir(parents=True)
+    stem_path = job_dir / "vocals.wav"
+    stem_path.write_bytes(b"wav" * 800)
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "preview_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.wav"},
+        "stem_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.wav"},
+    }
+
+    response = client.get(f"/api/preview/{job_id}/stem/vocals.wav")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.content == stem_path.read_bytes()
 
 
 def test_download_zip_returns_ready_archive(tmp_path, monkeypatch):

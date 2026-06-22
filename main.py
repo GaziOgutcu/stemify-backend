@@ -314,6 +314,14 @@ def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
         return serialize_job(job)
 
 
+def get_public_job(job_id: str) -> dict[str, Any]:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        return serialize_job(job)
+
+
 def payment_key(job_id: str, item_type: str, filename: str | None = None) -> str:
     return f"{job_id}:song"
 
@@ -411,6 +419,22 @@ def enforce_job_done(job: dict[str, Any]) -> None:
         409,
         {
             "message": "Stems are not ready yet.",
+            "status": job.get("status"),
+            "status_detail": job.get("status_detail"),
+            "elapsed_seconds": job.get("elapsed_seconds"),
+            "timeout_seconds": job.get("timeout_seconds"),
+        },
+    )
+
+
+def enforce_public_job_done(job: dict[str, Any]) -> None:
+    if job.get("status") == "done":
+        return
+
+    raise HTTPException(
+        409,
+        {
+            "message": "Preview stems are not ready yet.",
             "status": job.get("status"),
             "status_detail": job.get("status_detail"),
             "elapsed_seconds": job.get("elapsed_seconds"),
@@ -692,6 +716,12 @@ def validate_audio_files(paths: list[Path], label: str) -> None:
         validate_audio_file(path, f"{label} {path.name}")
 
 
+def public_stem_name(path: Path) -> str:
+    if path.stem == "no_vocals":
+        return "instrumental"
+    return path.stem
+
+
 @app.get("/api")
 async def root():
     return {
@@ -915,7 +945,7 @@ def payment_verification_response(
                 "stem_urls": job.get("stem_urls", {}),
                 "download_urls": {
                     "zip": job.get("zip_url"),
-                    "stems": job.get("stem_urls", {}),
+                    "stems": job.get("download_stem_urls", job.get("stem_urls", {})),
                 },
             }
         )
@@ -1246,9 +1276,13 @@ def run_demucs(
             for stem_file in output_files:
                 zf.write(stem_file, arcname=stem_file.name)
 
-        stem_names = [stem_file.stem for stem_file in output_files]
-        stem_urls = {
-            stem_file.stem: f"/api/download/{job_id}/stem/{stem_file.name}"
+        stem_names = [public_stem_name(stem_file) for stem_file in output_files]
+        preview_urls = {
+            public_stem_name(stem_file): f"/api/preview/{job_id}/stem/{stem_file.name}"
+            for stem_file in output_files
+        }
+        download_stem_urls = {
+            public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
             for stem_file in output_files
         }
         update_job(
@@ -1257,7 +1291,9 @@ def run_demucs(
             status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready.",
             stems=stem_names,
             zip_url=f"/api/download/{job_id}/zip",
-            stem_urls=stem_urls,
+            stem_urls=preview_urls,
+            preview_urls=preview_urls,
+            download_stem_urls=download_stem_urls,
             output_format=output_format,
         )
         print(f"[JOB {job_id[:8]}] Done: {stem_names}")
@@ -1288,6 +1324,37 @@ async def job_status(
     job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
 ):
     return JSONResponse(get_authorized_job(job_id, user))
+
+
+@app.get("/api/preview/{job_id}/stem/{filename}")
+async def preview_stem(job_id: str, filename: str):
+    if not SAFE_DOWNLOAD_RE.fullmatch(filename):
+        raise HTTPException(400, "Invalid stem filename.")
+
+    job = get_public_job(job_id)
+    enforce_public_job_done(job)
+    preview_urls = job.get("preview_urls") or job.get("stem_urls") or {}
+    if f"/api/preview/{job_id}/stem/{filename}" not in preview_urls.values():
+        raise HTTPException(404, "Preview stem not found.")
+
+    job_dir = OUTPUT_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(404, "Job not found.")
+
+    matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
+    if not matches:
+        raise HTTPException(404, "Preview stem not found.")
+    extension = matches[0].suffix.lower().lstrip(".")
+    media_type = OUTPUT_FORMATS.get(extension, OUTPUT_FORMATS["wav"])["media_type"]
+    audio_logger.info(
+        "Serving preview stem job_id=%s filename=%s path=%s media_type=%s size_bytes=%s",
+        job_id,
+        filename,
+        matches[0],
+        media_type,
+        matches[0].stat().st_size,
+    )
+    return FileResponse(matches[0], media_type=media_type, filename=filename)
 
 
 @app.get("/api/download/{job_id}/zip")
