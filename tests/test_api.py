@@ -1,5 +1,6 @@
 import hmac
 import json
+import sys
 import time
 from hashlib import sha256
 from pathlib import Path
@@ -712,7 +713,78 @@ def test_run_demucs_fails_when_expected_stems_are_missing(tmp_path, monkeypatch)
     assert "vocals.wav" in main.JOBS[job_id]["error"]
 
 
-def test_run_demucs_publishes_free_preview_urls_without_full_processing(tmp_path, monkeypatch):
+def test_convert_preview_wavs_to_mp3_uses_ffmpeg_and_records_metadata(
+    tmp_path, monkeypatch
+):
+    job_id = "preview-mp3-job"
+    wav = tmp_path / "vocals.wav"
+    wav.write_bytes(b"wav" * 500)
+
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(main, "audio_duration_seconds", lambda path: 12.5)
+
+    commands = []
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, *args, **kwargs):
+        commands.append(cmd)
+        Path(cmd[-1]).write_bytes(b"mp3" * 500)
+        return FakeProc()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    converted_files, metadata = main.convert_preview_wavs_to_mp3(job_id, [wav])
+
+    assert converted_files == [tmp_path / job_id / "preview" / "mp3" / "vocals.mp3"]
+    assert commands == [
+        [
+            "/usr/bin/ffmpeg",
+            "-y",
+            "-i",
+            str(wav),
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            str(tmp_path / job_id / "preview" / "mp3" / "vocals.mp3"),
+        ]
+    ]
+    assert metadata["vocals"]["size_bytes"] > 0
+    assert metadata["vocals"]["duration_seconds"] == 12.5
+    assert metadata["vocals"]["ffmpeg_return_code"] == 0
+
+
+def test_convert_preview_wavs_to_mp3_fails_when_duration_is_zero(tmp_path, monkeypatch):
+    wav = tmp_path / "vocals.wav"
+    wav.write_bytes(b"wav" * 500)
+
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(main, "audio_duration_seconds", lambda path: 0)
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, *args, **kwargs):
+        Path(cmd[-1]).write_bytes(b"mp3" * 500)
+        return FakeProc()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="no playable duration"):
+        main.convert_preview_wavs_to_mp3("zero-duration-job", [wav])
+
+
+def test_run_demucs_publishes_free_preview_urls_without_full_processing(
+    tmp_path, monkeypatch
+):
     job_id = "preview-url-job"
     job_dir = tmp_path / job_id
     input_path = tmp_path / "input.mp3"
@@ -740,24 +812,33 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(tmp_path
     demucs_calls = []
 
     def fake_run(cmd, *args, **kwargs):
-        demucs_calls.append(cmd)
+        if cmd[0] == sys.executable:
+            demucs_calls.append(cmd)
+        else:
+            Path(cmd[-1]).write_bytes(b"mp3" * 500)
         return FakeProc()
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main, "audio_duration_seconds", lambda path: 12.5)
+    monkeypatch.setattr(main.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     main.run_demucs(job_id, job_dir, input_path, 2, "song", "wav")
 
     assert main.JOBS[job_id]["status"] == "done"
     assert main.JOBS[job_id]["stems"] == ["vocals", "instrumental"]
     assert main.JOBS[job_id]["stem_urls"] == {
-        "instrumental": f"/api/preview/{job_id}/stem/no_vocals.wav",
-        "vocals": f"/api/preview/{job_id}/stem/vocals.wav",
+        "instrumental": f"/api/preview/{job_id}/stem/no_vocals.mp3",
+        "vocals": f"/api/preview/{job_id}/stem/vocals.mp3",
+    }
+    assert main.JOBS[job_id]["preview_durations_seconds"] == {
+        "instrumental": 12.5,
+        "vocals": 12.5,
     }
     assert main.JOBS[job_id]["download_stem_urls"] == {}
     assert main.JOBS[job_id]["download_urls"] == {"zip": None, "stems": {}}
     assert main.JOBS[job_id]["zip_url"] is None
     assert main.JOBS[job_id]["preview_stem_paths"]["vocals"].endswith(
-        f"{job_id}_preview/vocals.wav"
+        f"{job_id}/preview/mp3/vocals.mp3"
     )
     assert "full_stem_paths" not in main.JOBS[job_id]
     assert input_path.exists()
@@ -906,7 +987,9 @@ def test_checkout_uses_disk_job_after_memory_cache_clear(monkeypatch):
 def test_checkout_rejects_broken_preview_from_disk(monkeypatch):
     headers = auth_headers()
     job_id = "broken-preview-job"
-    write_test_job(job_id, preview_status="error", status="error", error="empty preview")
+    write_test_job(
+        job_id, preview_status="error", status="error", error="empty preview"
+    )
     main.JOBS.clear()
     monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
     monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_test_backend_only")

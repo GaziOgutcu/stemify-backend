@@ -690,7 +690,9 @@ def prepare_output_files(
         )
 
     format_config = OUTPUT_FORMATS[output_format]
-    base_dir = job_dir_for(job_id) if job_dir_for(job_id).exists() else OUTPUT_DIR / job_id
+    base_dir = (
+        job_dir_for(job_id) if job_dir_for(job_id).exists() else OUTPUT_DIR / job_id
+    )
     converted_dir = base_dir / output_scope / output_format
     converted_dir.mkdir(parents=True, exist_ok=True)
     converted_files: list[Path] = []
@@ -721,6 +723,74 @@ def prepare_output_files(
         converted_files.append(converted)
 
     return converted_files
+
+
+def convert_preview_wavs_to_mp3(
+    job_id: str, wavs: list[Path]
+) -> tuple[list[Path], dict[str, dict[str, float | int | str]]]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to export MP3 preview stems.")
+
+    base_dir = (
+        job_dir_for(job_id) if job_dir_for(job_id).exists() else OUTPUT_DIR / job_id
+    )
+    converted_dir = base_dir / "preview" / "mp3"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+    converted_files: list[Path] = []
+    preview_metadata: dict[str, dict[str, float | int | str]] = {}
+
+    for wav in wavs:
+        converted = converted_dir / f"{wav.stem}.mp3"
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(wav),
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            str(converted),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        size = converted.stat().st_size if converted.exists() else 0
+        duration = 0.0
+        validation_error = None
+        try:
+            if proc.returncode != 0:
+                err = (proc.stderr or "") + (proc.stdout or "")
+                raise RuntimeError(f"MP3 preview export failed: {err[-400:]}")
+            if not converted.is_file():
+                raise RuntimeError(f"MP3 preview was not created: {converted}")
+            if size <= 0:
+                raise RuntimeError(f"MP3 preview is empty: {converted}")
+            duration = audio_duration_seconds(converted)
+            if duration <= 0:
+                raise RuntimeError(f"MP3 preview has no playable duration: {converted}")
+        except RuntimeError as exc:
+            validation_error = str(exc)
+
+        public_name = public_stem_name(converted)
+        preview_metadata[public_name] = {
+            "path": str(converted),
+            "size_bytes": size,
+            "duration_seconds": duration,
+            "ffmpeg_return_code": proc.returncode,
+        }
+        audio_logger.info(
+            "Preview MP3 export job_id=%s path=%s size_bytes=%s duration_seconds=%.3f ffmpeg_return_code=%s",
+            job_id,
+            converted,
+            size,
+            duration,
+            proc.returncode,
+        )
+        if validation_error:
+            raise RuntimeError(validation_error)
+        converted_files.append(converted)
+
+    return converted_files, preview_metadata
 
 
 def normalize_quality(quality: str | None) -> str:
@@ -1215,12 +1285,14 @@ def ensure_paid_assets_ready(
             while time.time() < deadline:
                 time.sleep(1)
                 latest_job = get_public_job(job_id)
-                if latest_job.get("full_processing_status") == "ready" and latest_job.get(
-                    "zip_path"
-                ):
+                if latest_job.get(
+                    "full_processing_status"
+                ) == "ready" and latest_job.get("zip_path"):
                     return latest_job
                 if latest_job.get("full_processing_status") == "error":
-                    raise HTTPException(500, latest_job.get("error") or "Full processing failed.")
+                    raise HTTPException(
+                        500, latest_job.get("error") or "Full processing failed."
+                    )
             raise HTTPException(409, "Full stems are still processing.")
 
         original_input_path = job.get("original_input_path")
@@ -1526,6 +1598,8 @@ async def split_audio(
         "uploaded_file_path": str(input_path),
         "preview_status": "processing",
         "preview_stems": [],
+        "preview_durations_seconds": {},
+        "preview_file_info": {},
         "payment_status": "pending",
         "checkout_session_id": None,
         "stripe_payment_intent": None,
@@ -1691,10 +1765,10 @@ def run_demucs(
             print(f"[JOB {job_id[:8]}] FAILED:\n{err[-800:]}")
             update_job(
                 job_id,
-            status="error",
-            preview_status="error",
-            status_detail="Preview stem separation failed.",
-            error=f"Demucs error: {err[-400:]}",
+                status="error",
+                preview_status="error",
+                status_detail="Preview stem separation failed.",
+                error=f"Demucs error: {err[-400:]}",
             )
             return
 
@@ -1724,15 +1798,27 @@ def run_demucs(
             return
         validate_audio_files(wavs, "Demucs preview stem")
 
-        preview_output_files = prepare_output_files(
-            job_id, wavs, output_format, "preview"
-        )
-        validate_audio_files(preview_output_files, "Browser preview stem")
+        try:
+            preview_output_files, preview_file_info = convert_preview_wavs_to_mp3(
+                job_id, wavs
+            )
+        except RuntimeError as exc:
+            update_job(
+                job_id,
+                status="error",
+                preview_status="failed",
+                status_detail="Preview MP3 validation failed.",
+                error=str(exc),
+            )
+            return
+        preview_durations_seconds = {
+            name: info["duration_seconds"] for name, info in preview_file_info.items()
+        }
         audio_logger.info(
-            "Prepared browser preview stems job_id=%s preview_files=%s file_sizes=%s",
+            "Prepared browser preview MP3 stems job_id=%s preview_files=%s file_info=%s",
             job_id,
             [str(path) for path in preview_output_files],
-            {path.name: path.stat().st_size for path in preview_output_files},
+            preview_file_info,
         )
 
         stem_names = [public_stem_name(stem_file) for stem_file in preview_output_files]
@@ -1756,7 +1842,10 @@ def run_demucs(
             download_stem_urls={},
             download_urls={"zip": None, "stems": {}},
             source_duration_seconds=source_duration,
-            output_format=output_format,
+            output_format="mp3",
+            requested_output_format=output_format,
+            preview_durations_seconds=preview_durations_seconds,
+            preview_file_info=preview_file_info,
             quality=quality,
         )
         print(f"[JOB {job_id[:8]}] Preview done: {stem_names}")
@@ -1801,7 +1890,9 @@ async def preview_stem(job_id: str, filename: str):
     if f"/api/preview/{job_id}/stem/{filename}" not in preview_urls.values():
         raise HTTPException(404, "Preview stem not found.")
 
-    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
+    job_dir = (
+        job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
+    )
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
@@ -1836,7 +1927,9 @@ async def download_zip(
     job = get_authorized_job(job_id, user)
     enforce_job_done(job)
     enforce_paid_download(job, user, "zip")
-    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
+    job_dir = (
+        job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
+    )
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
     zip_path = Path(job["zip_path"]) if job.get("zip_path") else None
@@ -1861,7 +1954,9 @@ async def download_stem(
     job = get_authorized_job(job_id, user)
     enforce_job_done(job)
     enforce_paid_download(job, user, "stem", filename)
-    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
+    job_dir = (
+        job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
+    )
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
