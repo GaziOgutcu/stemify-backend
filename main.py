@@ -518,7 +518,7 @@ def enforce_job_done(job: dict[str, Any]) -> None:
 
 
 def enforce_public_job_done(job: dict[str, Any]) -> None:
-    if job.get("status") == "done":
+    if job.get("status") == "done" and job.get("preview_status") == "ready":
         return
 
     raise HTTPException(
@@ -526,6 +526,7 @@ def enforce_public_job_done(job: dict[str, Any]) -> None:
         {
             "message": "Preview stems are not ready yet.",
             "status": job.get("status"),
+            "preview_status": job.get("preview_status"),
             "status_detail": job.get("status_detail"),
             "elapsed_seconds": job.get("elapsed_seconds"),
             "timeout_seconds": job.get("timeout_seconds"),
@@ -742,8 +743,11 @@ def convert_preview_wavs_to_mp3(
 
     for wav in wavs:
         converted = converted_dir / f"{wav.stem}.mp3"
+        print(f"[JOB {job_id}] FFmpeg preview conversion starting", flush=True)
+        print(f"[JOB {job_id}] Preview WAV input: {wav}", flush=True)
+        print(f"[JOB {job_id}] Preview MP3 output: {converted}", flush=True)
         audio_logger.info(
-            "Converting preview WAV to MP3 with ffmpeg job_id=%s input_wav_path=%s output_mp3_path=%s",
+            "[JOB %s] FFmpeg preview conversion starting input_wav_path=%s output_mp3_path=%s",
             job_id,
             wav,
             converted,
@@ -784,9 +788,13 @@ def convert_preview_wavs_to_mp3(
             "size_bytes": size,
             "duration_seconds": duration,
             "ffmpeg_return_code": proc.returncode,
+            "media_type": "audio/mpeg",
         }
+        print(f"[JOB {job_id}] ffmpeg return code: {proc.returncode}", flush=True)
+        print(f"[JOB {job_id}] ffprobe duration: {duration}", flush=True)
+        print(f"[JOB {job_id}] MP3 size bytes: {size}", flush=True)
         audio_logger.info(
-            "Preview MP3 export job_id=%s input_wav_path=%s output_mp3_path=%s ffmpeg_return_code=%s ffprobe_duration=%.3f output_file_size_bytes=%s",
+            "[JOB %s] Preview MP3 export input_wav_path=%s output_mp3_path=%s ffmpeg_return_code=%s ffprobe_duration=%.3f output_file_size_bytes=%s",
             job_id,
             wav,
             converted,
@@ -982,6 +990,42 @@ def public_stem_name(path: Path) -> str:
     return path.stem
 
 
+def preview_debug_payload(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    preview_file_info = job.get("preview_file_info") or {}
+    preview_stem_paths = job.get("preview_stem_paths") or {}
+    mp3_paths = {
+        name: info.get("path")
+        for name, info in preview_file_info.items()
+        if isinstance(info, dict)
+    } or preview_stem_paths
+    sizes_bytes = {
+        name: info.get("size_bytes")
+        for name, info in preview_file_info.items()
+        if isinstance(info, dict)
+    }
+    durations_seconds = job.get("preview_durations_seconds") or {
+        name: info.get("duration_seconds")
+        for name, info in preview_file_info.items()
+        if isinstance(info, dict)
+    }
+    media_types = {
+        name: info.get("media_type", "audio/mpeg")
+        for name, info in preview_file_info.items()
+        if isinstance(info, dict)
+    }
+    return {
+        "job_id": job_id,
+        "preview_status": job.get("preview_status"),
+        "preview_urls": job.get("preview_urls") or job.get("stem_urls") or {},
+        "mp3_paths": mp3_paths,
+        "mp3_file_sizes": sizes_bytes,
+        "sizes_bytes": sizes_bytes,
+        "ffprobe_durations": durations_seconds,
+        "durations_seconds": durations_seconds,
+        "media_type": media_types,
+    }
+
+
 @app.get("/api")
 async def root():
     return {
@@ -1051,7 +1095,7 @@ async def create_checkout_session(
     validate_checkout_configuration()
 
     job = get_authorized_job(payload.job_id, user)
-    if job.get("preview_status") != "ready" and job.get("status") != "done":
+    if job.get("preview_status") != "ready" or job.get("status") != "done":
         raise HTTPException(
             409,
             {
@@ -1822,6 +1866,29 @@ def run_demucs(
         preview_durations_seconds = {
             name: info["duration_seconds"] for name, info in preview_file_info.items()
         }
+        invalid_preview_files = [
+            path
+            for path in preview_output_files
+            if path.suffix.lower() != ".mp3"
+            or preview_file_info.get(public_stem_name(path), {}).get(
+                "duration_seconds", 0
+            )
+            <= 0
+            or preview_file_info.get(public_stem_name(path), {}).get("size_bytes", 0)
+            <= 0
+        ]
+        if invalid_preview_files:
+            update_job(
+                job_id,
+                status="error",
+                preview_status="failed",
+                status_detail="Preview MP3 validation failed.",
+                error=(
+                    "Invalid preview MP3 files: "
+                    + ", ".join(str(path) for path in invalid_preview_files)
+                ),
+            )
+            return
         audio_logger.info(
             "Prepared browser preview MP3 stems job_id=%s preview_files=%s file_info=%s",
             job_id,
@@ -1885,33 +1952,33 @@ async def job_status(
     job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
 ):
     job = get_authorized_job(job_id, user)
-    preview_file_info = job.get("preview_file_info") or {}
-    preview_stem_paths = job.get("preview_stem_paths") or {}
+    response_job = dict(job)
+    for key in ("preview_stems", "stem_urls", "preview_urls"):
+        urls = response_job.get(key)
+        if isinstance(urls, dict):
+            response_job[key] = {
+                name: url for name, url in urls.items() if str(url).endswith(".mp3")
+            }
     return JSONResponse(
         {
-            **job,
-            "preview_debug": {
-                "mp3_paths": {
-                    name: info.get("path")
-                    for name, info in preview_file_info.items()
-                    if isinstance(info, dict)
-                }
-                or preview_stem_paths,
-                "durations_seconds": job.get("preview_durations_seconds") or {},
-                "sizes_bytes": {
-                    name: info.get("size_bytes")
-                    for name, info in preview_file_info.items()
-                    if isinstance(info, dict)
-                },
-            },
+            **response_job,
+            "preview_debug": preview_debug_payload(job_id, job),
         }
     )
+
+
+@app.get("/api/debug/job/{job_id}")
+async def debug_job(job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
+    job = get_authorized_job(job_id, user)
+    return JSONResponse(preview_debug_payload(job_id, job))
 
 
 @app.get("/api/preview/{job_id}/stem/{filename}")
 async def preview_stem(job_id: str, filename: str):
     if not SAFE_DOWNLOAD_RE.fullmatch(filename):
         raise HTTPException(400, "Invalid stem filename.")
+    if not filename.lower().endswith(".mp3"):
+        raise HTTPException(404, "Preview stems are only available as MP3 files.")
 
     job = get_public_job(job_id)
     enforce_public_job_done(job)
@@ -1936,8 +2003,7 @@ async def preview_stem(job_id: str, filename: str):
         stem_path = matches[0]
     if not stem_path.is_file():
         raise HTTPException(404, "Preview stem not found.")
-    extension = stem_path.suffix.lower().lstrip(".")
-    media_type = OUTPUT_FORMATS.get(extension, OUTPUT_FORMATS["wav"])["media_type"]
+    media_type = "audio/mpeg"
     audio_logger.info(
         "Serving preview stem job_id=%s filename=%s path=%s media_type=%s size_bytes=%s",
         job_id,
@@ -1946,7 +2012,12 @@ async def preview_stem(job_id: str, filename: str):
         media_type,
         stem_path.stat().st_size,
     )
-    return FileResponse(stem_path, media_type=media_type, filename=filename)
+    return FileResponse(
+        stem_path,
+        media_type=media_type,
+        filename=filename,
+        headers={"Accept-Ranges": "bytes"},
+    )
 
 
 @app.get("/api/download/{job_id}/zip")
