@@ -122,6 +122,12 @@ DEMUCS_OVERLAP = float(os.getenv("DEMUCS_OVERLAP", "0.1"))
 DEMUCS_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_SEGMENT_SECONDS", "8")))
 DEMUCS_JOBS = int(os.getenv("DEMUCS_JOBS", "0"))
 DEMUCS_DEVICE = os.getenv("DEMUCS_DEVICE", "")
+DEMUCS_HIGH_MODEL = os.getenv("DEMUCS_HIGH_MODEL", "htdemucs")
+DEMUCS_HIGH_SHIFTS = int(os.getenv("DEMUCS_HIGH_SHIFTS", "1"))
+DEMUCS_HIGH_OVERLAP = float(os.getenv("DEMUCS_HIGH_OVERLAP", "0.25"))
+DEMUCS_HIGH_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_HIGH_SEGMENT_SECONDS", "0")))
+DEMUCS_HIGH_JOBS = int(os.getenv("DEMUCS_HIGH_JOBS", str(DEMUCS_JOBS)))
+DEMUCS_HIGH_DEVICE = os.getenv("DEMUCS_HIGH_DEVICE", DEMUCS_DEVICE)
 DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
 DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
@@ -173,6 +179,24 @@ FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n"
 
 STEM_MODELS = {
     2: DEMUCS_MODEL,
+}
+QUALITY_SETTINGS = {
+    "fast": {
+        "models": STEM_MODELS,
+        "shifts": DEMUCS_SHIFTS,
+        "overlap": DEMUCS_OVERLAP,
+        "segment_seconds": DEMUCS_SEGMENT_SECONDS,
+        "jobs": DEMUCS_JOBS,
+        "device": DEMUCS_DEVICE,
+    },
+    "high": {
+        "models": {2: DEMUCS_HIGH_MODEL},
+        "shifts": DEMUCS_HIGH_SHIFTS,
+        "overlap": DEMUCS_HIGH_OVERLAP,
+        "segment_seconds": DEMUCS_HIGH_SEGMENT_SECONDS,
+        "jobs": DEMUCS_HIGH_JOBS,
+        "device": DEMUCS_HIGH_DEVICE,
+    },
 }
 DEMUCS_SEMAPHORE = threading.Semaphore(DEMUCS_CONCURRENCY)
 
@@ -633,14 +657,30 @@ def prepare_output_files(
     return converted_files
 
 
-def demucs_output_dir(job_dir: Path, preview_path: Path, stems: int) -> Path:
-    return job_dir / STEM_MODELS[stems] / preview_path.stem
+def normalize_quality(quality: str | None) -> str:
+    normalized = (quality or "fast").strip().lower()
+    if normalized not in QUALITY_SETTINGS:
+        raise HTTPException(
+            400,
+            f"Unsupported quality: {normalized or 'none'}. Choose one of: {', '.join(sorted(QUALITY_SETTINGS))}.",
+        )
+    return normalized
+
+
+def demucs_model_for_quality(stems: int, quality: str = "fast") -> str:
+    return QUALITY_SETTINGS[normalize_quality(quality)]["models"][stems]
+
+
+def demucs_output_dir(
+    job_dir: Path, preview_path: Path, stems: int, quality: str = "fast"
+) -> Path:
+    return job_dir / demucs_model_for_quality(stems, quality) / preview_path.stem
 
 
 def expected_demucs_stem_files(
-    job_dir: Path, preview_path: Path, stems: int
+    job_dir: Path, preview_path: Path, stems: int, quality: str = "fast"
 ) -> list[Path]:
-    output_dir = demucs_output_dir(job_dir, preview_path, stems)
+    output_dir = demucs_output_dir(job_dir, preview_path, stems, quality)
     if stems == 2:
         return [output_dir / "vocals.wav", output_dir / "no_vocals.wav"]
     return sorted(output_dir.glob("*.wav"))
@@ -770,6 +810,8 @@ async def root():
         "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
         "output_formats": sorted(OUTPUT_FORMATS),
         "default_output_format": "wav",
+        "qualities": sorted(QUALITY_SETTINGS),
+        "default_quality": "fast",
         "performance": {
             "demucs_model": DEMUCS_MODEL,
             "demucs_shifts": DEMUCS_SHIFTS,
@@ -796,6 +838,7 @@ async def health():
         "upload_dir": str(UPLOAD_DIR),
         "output_dir": str(OUTPUT_DIR),
         "output_formats": sorted(OUTPUT_FORMATS),
+        "qualities": sorted(QUALITY_SETTINGS),
     }
 
 
@@ -1094,6 +1137,7 @@ async def split_audio(
     file: UploadFile = File(...),
     stems: int = Form(2),
     output_format: str = Form("wav"),
+    quality: str = Form("fast"),
 ):
     if stems not in STEM_MODELS:
         raise HTTPException(
@@ -1101,6 +1145,7 @@ async def split_audio(
         )
 
     output_format = output_format.strip().lower()
+    quality = normalize_quality(quality)
     if output_format not in OUTPUT_FORMATS:
         raise HTTPException(
             400,
@@ -1145,6 +1190,7 @@ async def split_audio(
             "requested_stems": stems,
             "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
             "output_format": output_format,
+            "quality": quality,
             "started_at": now,
             "updated_at": now,
             "payment_status": "pending",
@@ -1156,7 +1202,7 @@ async def split_audio(
 
     thread = threading.Thread(
         target=run_demucs,
-        args=(job_id, job_dir, input_path, stems, safe_stem, output_format),
+        args=(job_id, job_dir, input_path, stems, safe_stem, output_format, quality),
         daemon=True,
     )
     thread.start()
@@ -1169,32 +1215,37 @@ async def split_audio(
             "track_name": safe_stem,
             "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
             "output_format": output_format,
+            "quality": quality,
             "available_output_formats": sorted(OUTPUT_FORMATS),
+            "available_qualities": sorted(QUALITY_SETTINGS),
             "user": usage_user(user),
         }
     )
 
 
-def build_demucs_command(job_dir: Path, preview_path: Path, stems: int) -> list[str]:
+def build_demucs_command(
+    job_dir: Path, preview_path: Path, stems: int, quality: str = "fast"
+) -> list[str]:
+    settings = QUALITY_SETTINGS[normalize_quality(quality)]
     cmd = [
         sys.executable,
         "-m",
         "demucs",
         "-n",
-        STEM_MODELS[stems],
+        settings["models"][stems],
         "--out",
         str(job_dir),
         "--shifts",
-        str(DEMUCS_SHIFTS),
+        str(settings["shifts"]),
         "--overlap",
-        str(DEMUCS_OVERLAP),
+        str(settings["overlap"]),
     ]
-    if DEMUCS_SEGMENT_SECONDS > 0:
-        cmd += ["--segment", str(DEMUCS_SEGMENT_SECONDS)]
-    if DEMUCS_JOBS > 0:
-        cmd += ["--jobs", str(DEMUCS_JOBS)]
-    if DEMUCS_DEVICE:
-        cmd += ["--device", DEMUCS_DEVICE]
+    if settings["segment_seconds"] > 0:
+        cmd += ["--segment", str(settings["segment_seconds"])]
+    if settings["jobs"] > 0:
+        cmd += ["--jobs", str(settings["jobs"])]
+    if settings["device"]:
+        cmd += ["--device", settings["device"]]
     if stems == 2:
         cmd += ["--two-stems", "vocals"]
     cmd.append(str(preview_path))
@@ -1219,6 +1270,7 @@ def run_demucs(
     stems: int,
     track_name: str,
     output_format: str,
+    quality: str = "fast",
 ) -> None:
     preview_path: Path | None = None
     try:
@@ -1229,9 +1281,9 @@ def run_demucs(
             "Starting preview split job_id=%s input_path=%s", job_id, input_path
         )
         preview_path = create_preview_input(job_id, input_path)
-        cmd = build_demucs_command(job_dir, preview_path, stems)
+        cmd = build_demucs_command(job_dir, preview_path, stems, quality)
         env = demucs_subprocess_env()
-        demucs_dir = demucs_output_dir(job_dir, preview_path, stems)
+        demucs_dir = demucs_output_dir(job_dir, preview_path, stems, quality)
         audio_logger.info(
             "Prepared Demucs job job_id=%s command=%s output_dir=%s preview_path=%s preview_size_bytes=%s",
             job_id,
@@ -1251,7 +1303,7 @@ def run_demucs(
             update_job(
                 job_id,
                 status_detail=(
-                    f"Separating the {PREVIEW_DURATION_SECONDS}-second preview with {STEM_MODELS[stems]}."
+                    f"Separating the {PREVIEW_DURATION_SECONDS}-second preview with {demucs_model_for_quality(stems, quality)} ({quality} quality)."
                 ),
             )
             print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
@@ -1281,7 +1333,7 @@ def run_demucs(
             job_id,
             status_detail=f"Finalizing preview stem files as {output_format.upper()}.",
         )
-        wavs = expected_demucs_stem_files(job_dir, preview_path, stems)
+        wavs = expected_demucs_stem_files(job_dir, preview_path, stems, quality)
         audio_logger.info(
             "Checking Demucs output job_id=%s output_dir=%s generated_stems=%s",
             job_id,
@@ -1334,6 +1386,7 @@ def run_demucs(
             preview_urls=preview_urls,
             download_stem_urls=download_stem_urls,
             output_format=output_format,
+            quality=quality,
         )
         print(f"[JOB {job_id[:8]}] Done: {stem_names}")
 

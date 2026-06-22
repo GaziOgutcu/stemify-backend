@@ -16,6 +16,7 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
   - `stems`: always `2` for vocals and instrumental
   - `output_format`: optional `wav`, `mp3`, `flac`, `ogg`, or `m4a` for the generated download files; defaults to `wav`
+  - `quality`: optional `fast` or `high`; defaults to `fast` for backward-compatible uploads
 - `GET /api/job/{job_id}` - poll job status until it is `done` or `error`.
 - `GET /api/download/{job_id}/zip` - download all produced stems as a ZIP.
 - `GET /api/preview/{job_id}/stem/{filename}` - stream a generated 15-second preview stem for browser audio players. These URLs are returned in `stem_urls` / `preview_urls` after the job is `done`.
@@ -50,6 +51,12 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `DEMUCS_SEGMENT_SECONDS` | `8` | Smaller Demucs processing chunks reduce memory pressure and usually improve CPU stability on small Railway containers. |
 | `DEMUCS_JOBS` | `0` | Optional Demucs worker count; keep `0` for one preview at a time unless you have spare CPU/RAM. |
 | `DEMUCS_DEVICE` | empty | Optional Demucs device override such as `cuda` or `cpu`. |
+| `DEMUCS_HIGH_MODEL` | `htdemucs` | Demucs model used when `/api/split` is called with `quality=high`. |
+| `DEMUCS_HIGH_SHIFTS` | `1` | Higher-quality test-time shifts for `quality=high`; increase only where processing time is acceptable. |
+| `DEMUCS_HIGH_OVERLAP` | `0.25` | Higher-quality split overlap for `quality=high`. |
+| `DEMUCS_HIGH_SEGMENT_SECONDS` | `0` | Optional high-quality segment size; `0` lets Demucs use the selected model default. |
+| `DEMUCS_HIGH_JOBS` | same as `DEMUCS_JOBS` | Optional Demucs worker count for `quality=high`. |
+| `DEMUCS_HIGH_DEVICE` | same as `DEMUCS_DEVICE` | Optional device override for `quality=high`, such as `cuda` on GPU infrastructure. |
 | `DEMUCS_CPU_THREADS` | `2` | CPU threads exposed to Torch/BLAS in the Demucs subprocess. Tune to your Railway CPU allocation. |
 | `DEMUCS_CONCURRENCY` | `1` | Maximum concurrent Demucs subprocesses. Keep at `1` on CPU Railway deployments to avoid multiple jobs slowing each other down or exhausting memory. |
 | `UPLOAD_DIR` | `uploads` | Temporary upload directory. |
@@ -80,6 +87,7 @@ export async function splitTrack(file: File, firebaseIdToken: string) {
   formData.append("file", file);
   formData.append("stems", "2");
   formData.append("output_format", "mp3"); // or wav, flac, ogg, m4a
+  formData.append("quality", "fast"); // or high
 
   const upload = await fetch(`${API_URL}/api/split`, {
     method: "POST",
@@ -132,7 +140,7 @@ Production checklist for the frontend:
 3. Disable the upload button while a job is processing.
 4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token. Make sure the frontend starts only one polling interval per job and clears it when the job reaches `done` or `error`.
 5. Show the 15-second vocal/instrumental preview after `status === "done"` using `job.stem_urls` / `job.preview_urls`; these point to `/api/preview/...` URLs that can be assigned directly to `<audio src>` without custom headers.
-6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) before uploading; send it as `output_format`.
+6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) and quality (`fast` or `high`) before uploading; send them as `output_format` and `quality`.
 7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Include `return_path` if your download UI is not at `/`, for example `{ "job_id": jobId, "item_type": "song", "return_path": "/download" }`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
 8. For a static Vercel `index.html`, store the current `job_id`, selected filename, output format, and UI state in `localStorage` as soon as `/api/split` returns. Stripe redirects back to `<return_path>?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=<job_id>` or `<return_path>?payment=cancelled&job_id=<job_id>`; parse those query params on page load and navigate/render the results/download section instead of showing the initial upload screen.
 9. When `payment=success`, show a "Payment successful. Preparing your download..." message and call `GET /api/payment/verify?session_id=<session_id>&job_id=<job_id>` with the bearer token. The backend retrieves the Checkout Session from Stripe, verifies the session/job/user mapping, marks the job paid, and returns `download_urls.zip` plus paid stem URLs only when Stripe says it is paid.
@@ -150,4 +158,4 @@ The included Dockerfile installs FFmpeg, Demucs, and DiffQ for the default quant
 ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
 ```
 
-For speed, the backend now runs the quantized `mdx_q` Demucs model, no test-time shifts, low overlap, bounded segment size, one Demucs worker at a time, and explicit Torch/BLAS CPU thread limits by default. Set `DEMUCS_DEVICE=cuda` on GPU infrastructure for much faster processing, or set `DEMUCS_MODEL=htdemucs` if quality matters more than CPU speed. Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
+For speed, the default `quality=fast` path runs the quantized `mdx_q` Demucs model, no test-time shifts, low overlap, bounded segment size, one Demucs worker at a time, and explicit Torch/BLAS CPU thread limits. The optional `quality=high` path uses the configured higher-quality Demucs settings (`htdemucs`, shifts, and overlap by default) where the runtime has those model resources available. Set `DEMUCS_DEVICE=cuda` or `DEMUCS_HIGH_DEVICE=cuda` on GPU infrastructure for much faster processing. Firebase handles user identity. The current user stem totals and job stores are still in memory, so deploy as a single backend instance only for early testing. Add Postgres/Redis before production so usage counts and jobs survive restarts and work across multiple backend instances.
