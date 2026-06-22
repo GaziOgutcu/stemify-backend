@@ -18,10 +18,11 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
   - `output_format`: optional `wav`, `mp3`, `flac`, `ogg`, or `m4a` for the generated download files; defaults to `wav`
 - `GET /api/job/{job_id}` - poll job status until it is `done` or `error`.
 - `GET /api/download/{job_id}/zip` - download all produced stems as a ZIP.
-- `GET /api/download/{job_id}/stem/{filename}` - download one stem in the requested output format.
+- `GET /api/preview/{job_id}/stem/{filename}` - stream a generated 15-second preview stem for browser audio players. These URLs are returned in `stem_urls` / `preview_urls` after the job is `done`.
+- `GET /api/download/{job_id}/stem/{filename}` - download one paid stem in the requested output format.
 - `DELETE /api/cleanup/{job_id}` - remove output files and forget the job.
 
-All split, job status, payment checkout/status, download, cleanup, and profile endpoints require an `Authorization: Bearer <firebase_id_token>` header from Firebase Google Sign-In. The Stripe webhook endpoint is called by Stripe and is verified with `STRIPE_WEBHOOK_SECRET`. Each submitted split job is tied to that signed-in Firebase user.
+All split, job status, payment checkout/status, download, cleanup, and profile endpoints require an `Authorization: Bearer <firebase_id_token>` header from Firebase Google Sign-In. Preview stem URLs under `/api/preview/...` are intentionally bearer-token-free because native browser audio elements cannot attach Firebase authorization headers; the unguessable job ID scopes access to the generated 15-second preview. The Stripe webhook endpoint is called by Stripe and is verified with `STRIPE_WEBHOOK_SECRET`. Each submitted split job is tied to that signed-in Firebase user.
 
 Job status responses include `status_detail`, `elapsed_seconds`, `timeout_seconds`, and `output_format` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the preview job status is `done`.
 
@@ -59,7 +60,8 @@ Open `http://localhost:8000/api/health` to verify the server is running.
 | `PAYMENT_CURRENCY` | `aud` | Currency for Stripe Checkout. The production default is AUD for the $3.00 AUD download. |
 | `STRIPE_SECRET_KEY` | empty | Stripe secret key used only by the FastAPI backend on Railway to create Checkout Sessions. If present and `PAYMENTS_ENABLED` is unset, paid downloads are enabled automatically. Never expose this in frontend code or `index.html`. |
 | `STRIPE_WEBHOOK_SECRET` | empty | Stripe webhook signing secret used by `/api/stripe/webhook` to verify Stripe events before unlocking downloads. |
-| `FRONTEND_URL` | `http://localhost:3000` | Frontend URL used for Stripe Checkout success/cancel redirects. |
+| `FRONTEND_URL` | `http://localhost:3000` | Frontend origin used for Stripe Checkout success/cancel redirects. Use only the scheme/host, for example `https://vocalsplitter.app`. |
+| `FRONTEND_RETURN_PATH` | `/` | Default frontend route/path to receive Stripe redirects, for example `/download` or `/#/download`. The backend appends `payment`, `session_id`, and `job_id` query parameters. |
 | `FIREBASE_PROJECT_ID` | empty | Firebase project ID used by Firebase Admin SDK. |
 | `FIREBASE_CLIENT_EMAIL` | empty | Firebase service account client email. |
 | `FIREBASE_PRIVATE_KEY` | empty | Firebase service account private key. Store this in Railway, not in code. |
@@ -129,11 +131,11 @@ Production checklist for the frontend:
 2. Validate file extensions and display the backend size limit before upload.
 3. Disable the upload button while a job is processing.
 4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token. Make sure the frontend starts only one polling interval per job and clears it when the job reaches `done` or `error`.
-5. Show the 15-second vocal/instrumental preview after `status === "done"`.
+5. Show the 15-second vocal/instrumental preview after `status === "done"` using `job.stem_urls` / `job.preview_urls`; these point to `/api/preview/...` URLs that can be assigned directly to `<audio src>` without custom headers.
 6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) before uploading; send it as `output_format`.
-7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
-8. For a static Vercel `index.html`, store the current `job_id`, selected filename, and UI state in `localStorage` as soon as `/api/split` returns. Stripe redirects back to `/?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=<job_id>` or `/?payment=cancelled&job_id=<job_id>`; parse those query params in `index.html`, but never unlock downloads from query params alone.
-9. When `payment=success`, show a "Payment successful. Preparing your download..." message and call `GET /api/payment/verify?session_id=<session_id>&job_id=<job_id>` with the bearer token. The backend retrieves the Checkout Session from Stripe, verifies the session/job/user mapping, marks the job paid, and returns download URLs only when Stripe says it is paid.
+7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Include `return_path` if your download UI is not at `/`, for example `{ "job_id": jobId, "item_type": "song", "return_path": "/download" }`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
+8. For a static Vercel `index.html`, store the current `job_id`, selected filename, output format, and UI state in `localStorage` as soon as `/api/split` returns. Stripe redirects back to `<return_path>?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=<job_id>` or `<return_path>?payment=cancelled&job_id=<job_id>`; parse those query params on page load and navigate/render the results/download section instead of showing the initial upload screen.
+9. When `payment=success`, show a "Payment successful. Preparing your download..." message and call `GET /api/payment/verify?session_id=<session_id>&job_id=<job_id>` with the bearer token. The backend retrieves the Checkout Session from Stripe, verifies the session/job/user mapping, marks the job paid, and returns `download_urls.zip` plus paid stem URLs only when Stripe says it is paid.
 10. When `payment=cancelled`, restore the saved job state from `localStorage` and show "Payment cancelled. Your preview is still available." Do not reset the upload UI after returning from Stripe; if `localStorage` has a previous `job_id`, offer a "Resume previous split" action.
 11. Configure Stripe to send `checkout.session.completed` events to `/api/stripe/webhook`; webhook confirmation is still accepted, and backend Stripe API verification covers the immediate post-checkout redirect path.
 12. Call `DELETE /api/cleanup/{job_id}` with the bearer token after the user downloads files or when leaving the result page.
