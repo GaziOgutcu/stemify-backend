@@ -514,6 +514,35 @@ def test_stripe_webhook_marks_payment_paid(monkeypatch):
     assert main.PAYMENTS["cs_paid"]["status"] == "paid"
 
 
+def test_paid_checkout_starts_full_generation_in_background(monkeypatch):
+    main.JOBS["paid-background-job"] = {
+        "job_id": "paid-background-job",
+        "user_uid": "test-uid",
+        "status": "done",
+        "zip_url": None,
+    }
+    started_jobs = []
+    monkeypatch.setattr(
+        main, "start_paid_assets_generation", lambda job_id: started_jobs.append(job_id)
+    )
+
+    payment = main.mark_checkout_session_paid(
+        {
+            "id": "cs_background_paid",
+            "payment_status": "paid",
+            "metadata": {
+                "job_id": "paid-background-job",
+                "item_type": "song",
+                "user_uid": "test-uid",
+            },
+        },
+        verification_source="webhook",
+    )
+
+    assert payment["status"] == "paid"
+    assert started_jobs == ["paid-background-job"]
+
+
 def test_requirements_include_diffq_for_quantized_demucs_model():
     requirements = Path("requirements.txt").read_text()
 
@@ -628,7 +657,7 @@ def test_run_demucs_fails_when_expected_stems_are_missing(tmp_path, monkeypatch)
     assert "vocals.wav" in main.JOBS[job_id]["error"]
 
 
-def test_run_demucs_publishes_free_preview_urls(tmp_path, monkeypatch):
+def test_run_demucs_publishes_free_preview_urls_without_full_processing(tmp_path, monkeypatch):
     job_id = "preview-url-job"
     job_dir = tmp_path / job_id
     input_path = tmp_path / "input.mp3"
@@ -639,10 +668,6 @@ def test_run_demucs_publishes_free_preview_urls(tmp_path, monkeypatch):
     demucs_dir.mkdir(parents=True)
     (demucs_dir / "vocals.wav").write_bytes(b"v" * 2048)
     (demucs_dir / "no_vocals.wav").write_bytes(b"i" * 2048)
-    full_demucs_dir = job_dir / "mdx_q" / input_path.stem
-    full_demucs_dir.mkdir(parents=True)
-    (full_demucs_dir / "vocals.wav").write_bytes(b"full-v" * 2048)
-    (full_demucs_dir / "no_vocals.wav").write_bytes(b"full-i" * 2048)
     main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
 
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
@@ -657,7 +682,13 @@ def test_run_demucs_publishes_free_preview_urls(tmp_path, monkeypatch):
         stdout = ""
         stderr = ""
 
-    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: FakeProc())
+    demucs_calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        demucs_calls.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
 
     main.run_demucs(job_id, job_dir, input_path, 2, "song", "wav")
 
@@ -667,14 +698,17 @@ def test_run_demucs_publishes_free_preview_urls(tmp_path, monkeypatch):
         "instrumental": f"/api/preview/{job_id}/stem/no_vocals.wav",
         "vocals": f"/api/preview/{job_id}/stem/vocals.wav",
     }
-    assert main.JOBS[job_id]["download_stem_urls"] == {
-        "instrumental": f"/api/download/{job_id}/stem/no_vocals.wav",
-        "vocals": f"/api/download/{job_id}/stem/vocals.wav",
-    }
+    assert main.JOBS[job_id]["download_stem_urls"] == {}
+    assert main.JOBS[job_id]["download_urls"] == {"zip": None, "stems": {}}
+    assert main.JOBS[job_id]["zip_url"] is None
     assert main.JOBS[job_id]["preview_stem_paths"]["vocals"].endswith(
         f"{job_id}_preview/vocals.wav"
     )
-    assert main.JOBS[job_id]["full_stem_paths"]["vocals"].endswith("input/vocals.wav")
+    assert "full_stem_paths" not in main.JOBS[job_id]
+    assert input_path.exists()
+    assert len(demucs_calls) == 1
+    assert str(preview_path) in demucs_calls[0]
+    assert str(input_path) not in demucs_calls[0]
 
 
 def test_split_requires_authentication():
