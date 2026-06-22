@@ -696,7 +696,11 @@ def test_run_demucs_fails_when_expected_stems_are_missing(tmp_path, monkeypatch)
     input_path.write_bytes(b"audio")
     preview_path = tmp_path / f"{job_id}_preview.wav"
     preview_path.write_bytes(b"preview" * 400)
-    main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "processing",
+    }
 
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
@@ -800,7 +804,11 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(
     demucs_dir.mkdir(parents=True)
     (demucs_dir / "vocals.wav").write_bytes(b"v" * 2048)
     (demucs_dir / "no_vocals.wav").write_bytes(b"i" * 2048)
-    main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "processing",
+    }
 
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
@@ -870,6 +878,13 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(
     assert all(call[-1].endswith(".mp3") for call in ffmpeg_calls)
     assert str(preview_path) in demucs_calls[0]
     assert str(input_path) not in demucs_calls[0]
+
+    job_response = client.get(f"/api/job/{job_id}", headers=auth_headers())
+    assert job_response.status_code == 200
+    preview_url = job_response.json()["preview_stems"]["vocals"]
+    preview_response = client.get(preview_url)
+    assert preview_response.status_code == 200
+    assert preview_response.headers["content-type"] == "audio/mpeg"
 
 
 def test_split_requires_authentication():
@@ -1040,6 +1055,11 @@ def test_debug_job_reports_preview_mp3_metadata(tmp_path):
     assert payload["mp3_file_sizes"]["vocals"] == 1234
     assert payload["ffprobe_durations"]["vocals"] == 12.5
     assert payload["media_type"]["vocals"] == "audio/mpeg"
+    assert payload["preview_files"]["vocals"]["filename"] == "vocals.mp3"
+    assert payload["preview_files"]["vocals"]["exists"] is False
+    assert payload["preview_files"]["vocals"]["physical_paths"][0].endswith(
+        "vocals.mp3"
+    )
 
 
 def test_checkout_uses_disk_job_after_memory_cache_clear(monkeypatch):

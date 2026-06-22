@@ -960,6 +960,51 @@ def get_recorded_path(job: dict[str, Any], key: str, public_name: str) -> Path |
     return Path(recorded) if recorded else None
 
 
+def preview_file_candidates(
+    job_id: str, filename: str, job: dict[str, Any]
+) -> list[Path]:
+    public_name = public_stem_name(Path(filename))
+    candidates: list[Path] = []
+    recorded_path = get_recorded_path(job, "preview_stem_paths", public_name)
+    if recorded_path:
+        candidates.append(recorded_path)
+    candidates.extend(
+        [
+            job_dir_for(job_id) / "preview" / "mp3" / filename,
+            OUTPUT_DIR / job_id / "preview" / "mp3" / filename,
+        ]
+    )
+    for base_dir in (job_dir_for(job_id), OUTPUT_DIR / job_id):
+        if base_dir.is_dir():
+            candidates.extend(
+                sorted(path for path in base_dir.rglob(filename) if path.is_file())
+            )
+
+    unique_candidates: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key not in seen:
+            unique_candidates.append(path)
+            seen.add(key)
+    return unique_candidates
+
+
+def preview_files_debug(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    preview_urls = job.get("preview_urls") or job.get("stem_urls") or {}
+    files: dict[str, Any] = {}
+    for name, url in preview_urls.items():
+        filename = Path(str(urlparse(str(url)).path)).name
+        candidates = preview_file_candidates(job_id, filename, job)
+        files[name] = {
+            "url": url,
+            "filename": filename,
+            "physical_paths": [str(path) for path in candidates],
+            "exists": any(path.is_file() for path in candidates),
+        }
+    return files
+
+
 def reject_preview_paid_path(path: Path) -> None:
     if "_preview" in path.stem or any(
         part.lower() == "preview" or part.lower().endswith("_preview")
@@ -1023,6 +1068,7 @@ def preview_debug_payload(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
         "ffprobe_durations": durations_seconds,
         "durations_seconds": durations_seconds,
         "media_type": media_types,
+        "preview_files": preview_files_debug(job_id, job),
     }
 
 
@@ -1289,7 +1335,11 @@ def _paid_assets_worker(job_id: str) -> None:
 def ensure_paid_assets_ready(
     job_id: str, owns_processing: bool = False
 ) -> dict[str, Any]:
-    job = get_public_job(job_id)
+    try:
+        job = get_public_job(job_id)
+    except HTTPException as exc:
+        log_preview_response(exc.status_code)
+        raise
     if job.get("zip_url"):
         return job
     if job.get("payment_status") != "paid":
@@ -1959,6 +2009,11 @@ async def job_status(
             response_job[key] = {
                 name: url for name, url in urls.items() if str(url).endswith(".mp3")
             }
+    audio_logger.info(
+        "[PREVIEW] /api/job/%s response: %s",
+        job_id,
+        json.dumps(response_job, default=str),
+    )
     return JSONResponse(
         {
             **response_job,
@@ -1975,33 +2030,51 @@ async def debug_job(job_id: str, user: Annotated[dict[str, Any], Depends(current
 
 @app.get("/api/preview/{job_id}/stem/{filename}")
 async def preview_stem(job_id: str, filename: str):
+    def log_preview_response(
+        status_code: int, resolved_path: Path | None = None, exists: bool = False
+    ) -> None:
+        audio_logger.info(
+            "[PREVIEW] requested job_id=%s filename=%s resolved_path=%s exists=%s response_code=%s",
+            job_id,
+            filename,
+            resolved_path,
+            exists,
+            status_code,
+        )
+        print(f"[PREVIEW] requested: {filename}", flush=True)
+        print(f"[PREVIEW] requested job_id: {job_id}", flush=True)
+        print(f"[PREVIEW] resolved path: {resolved_path}", flush=True)
+        print(f"[PREVIEW] exists: {str(exists).lower()}", flush=True)
+        print(f"[PREVIEW] response code: {status_code}", flush=True)
+
     if not SAFE_DOWNLOAD_RE.fullmatch(filename):
+        log_preview_response(400)
         raise HTTPException(400, "Invalid stem filename.")
     if not filename.lower().endswith(".mp3"):
+        log_preview_response(404)
         raise HTTPException(404, "Preview stems are only available as MP3 files.")
 
-    job = get_public_job(job_id)
-    enforce_public_job_done(job)
+    try:
+        job = get_public_job(job_id)
+    except HTTPException as exc:
+        log_preview_response(exc.status_code)
+        raise
+    try:
+        enforce_public_job_done(job)
+    except HTTPException as exc:
+        log_preview_response(exc.status_code)
+        raise
     preview_urls = job.get("preview_urls") or job.get("stem_urls") or {}
     if f"/api/preview/{job_id}/stem/{filename}" not in preview_urls.values():
+        log_preview_response(404)
         raise HTTPException(404, "Preview stem not found.")
 
-    job_dir = (
-        job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
-    )
-    if not job_dir.is_dir():
-        raise HTTPException(404, "Job not found.")
-
-    public_name = public_stem_name(Path(filename))
-    recorded_path = get_recorded_path(job, "preview_stem_paths", public_name)
-    if recorded_path and recorded_path.name == filename and recorded_path.is_file():
-        stem_path = recorded_path
-    else:
-        matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
-        if not matches:
-            raise HTTPException(404, "Preview stem not found.")
-        stem_path = matches[0]
-    if not stem_path.is_file():
+    candidates = preview_file_candidates(job_id, filename, job)
+    stem_path = next((path for path in candidates if path.is_file()), None)
+    resolved_path = stem_path or (candidates[0] if candidates else None)
+    exists = bool(stem_path and stem_path.is_file())
+    if not stem_path:
+        log_preview_response(404, resolved_path, exists)
         raise HTTPException(404, "Preview stem not found.")
     media_type = "audio/mpeg"
     audio_logger.info(
@@ -2012,6 +2085,7 @@ async def preview_stem(job_id: str, filename: str):
         media_type,
         stem_path.stat().st_size,
     )
+    log_preview_response(200, stem_path, True)
     return FileResponse(
         stem_path,
         media_type=media_type,
