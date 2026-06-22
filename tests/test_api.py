@@ -15,11 +15,14 @@ FIREBASE_TOKENS = {}
 
 
 @pytest.fixture(autouse=True)
-def reset_auth_state(monkeypatch):
+def reset_auth_state(monkeypatch, tmp_path):
     main.USERS.clear()
     main.JOBS.clear()
     main.PAYMENTS.clear()
     main.USER_PAYMENT_JOBS.clear()
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(main, "JOBS_DIR", jobs_dir)
     FIREBASE_TOKENS.clear()
 
     main.firebase_admin._apps["test"] = object()
@@ -55,6 +58,36 @@ def stripe_signature(payload: bytes, secret: str) -> str:
     signed_payload = timestamp.encode("utf-8") + b"." + payload
     signature = hmac.new(secret.encode("utf-8"), signed_payload, sha256).hexdigest()
     return f"t={timestamp},v1={signature}"
+
+
+def write_test_job(job_id: str, **overrides):
+    now = time.time()
+    job = {
+        "job_id": job_id,
+        "original_filename": "song.mp3",
+        "uploaded_file_path": str(main.job_dir_for(job_id) / "input" / "song.mp3"),
+        "preview_status": "ready",
+        "preview_stems": {"vocals": f"/api/preview/{job_id}/stem/vocals.wav"},
+        "payment_status": "pending",
+        "checkout_session_id": None,
+        "stripe_payment_intent": None,
+        "full_processing_status": "not_started",
+        "full_stems": {},
+        "zip_path": None,
+        "error": None,
+        "created_at": now,
+        "updated_at": now,
+        "status": "done",
+        "user_uid": "test-uid",
+        "user_email": "tester@example.com",
+        "requested_stems": 2,
+        "track_name": "song",
+        "output_format": "wav",
+        "quality": "fast",
+    }
+    job.update(overrides)
+    main.write_job_json(job)
+    return job
 
 
 def test_health_includes_runtime_details():
@@ -515,12 +548,8 @@ def test_stripe_webhook_marks_payment_paid(monkeypatch):
 
 
 def test_paid_checkout_starts_full_generation_in_background(monkeypatch):
-    main.JOBS["paid-background-job"] = {
-        "job_id": "paid-background-job",
-        "user_uid": "test-uid",
-        "status": "done",
-        "zip_url": None,
-    }
+    write_test_job("paid-background-job")
+    main.JOBS.clear()
     started_jobs = []
     monkeypatch.setattr(
         main, "start_paid_assets_generation", lambda job_id: started_jobs.append(job_id)
@@ -541,6 +570,32 @@ def test_paid_checkout_starts_full_generation_in_background(monkeypatch):
 
     assert payment["status"] == "paid"
     assert started_jobs == ["paid-background-job"]
+    assert main.load_job_json("paid-background-job")["payment_status"] == "paid"
+
+
+def test_full_processing_lock_prevents_duplicate_processing(monkeypatch, tmp_path):
+    job_id = "locked-full-job"
+    input_path = main.job_dir_for(job_id) / "input" / "song.mp3"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_bytes(b"audio")
+    write_test_job(
+        job_id,
+        uploaded_file_path=str(input_path),
+        original_input_path=str(input_path),
+        payment_status="paid",
+        full_processing_status="processing",
+    )
+    lock_path = main.job_dir_for(job_id) / "full_processing.lock"
+    lock_path.write_text("locked")
+    monkeypatch.setattr(main, "DEMUCS_TIMEOUT_SECONDS", 0)
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("duplicate full Demucs processing should not start")
+
+    monkeypatch.setattr(main.subprocess, "run", fail_run)
+
+    with pytest.raises(main.HTTPException):
+        main.ensure_paid_assets_ready(job_id)
 
 
 def test_requirements_include_diffq_for_quantized_demucs_model():
@@ -798,10 +853,71 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     assert "fast" in payload["available_qualities"]
     assert main.JOBS[payload["job_id"]]["output_format"] == "mp3"
     assert main.JOBS[payload["job_id"]]["quality"] == "high"
+    job_json = main.load_job_json(payload["job_id"])
+    assert job_json["original_filename"] == "My Song!!!.mp3"
+    assert job_json["preview_status"] == "processing"
+    assert job_json["payment_status"] == "pending"
+    assert Path(job_json["uploaded_file_path"]).is_file()
     assert payload["user"]["stem_count"] == 2
     assert payload["user"]["jobs_created"] == 1
     assert payload["job_id"] in main.JOBS
     client.delete(f"/api/cleanup/{payload['job_id']}", headers=headers)
+
+
+def test_job_status_survives_cleared_memory_cache():
+    headers = auth_headers()
+    job_id = "disk-backed-job"
+    write_test_job(job_id, status_detail="Preview ready from disk.")
+    main.JOBS.clear()
+
+    response = client.get(f"/api/job/{job_id}", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    assert response.json()["preview_status"] == "ready"
+
+
+def test_checkout_uses_disk_job_after_memory_cache_clear(monkeypatch):
+    headers = auth_headers()
+    job_id = "disk-checkout-job"
+    write_test_job(job_id)
+    main.JOBS.clear()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_test_backend_only")
+    monkeypatch.setattr(
+        main,
+        "stripe_request",
+        lambda method, path, data=None: {
+            "id": "cs_disk_job",
+            "url": "https://checkout.stripe.test/disk",
+        },
+    )
+
+    response = client.post(
+        "/api/create-checkout-session",
+        json={"job_id": job_id, "item_type": "song"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert main.load_job_json(job_id)["checkout_session_id"] == "cs_disk_job"
+
+
+def test_checkout_rejects_broken_preview_from_disk(monkeypatch):
+    headers = auth_headers()
+    job_id = "broken-preview-job"
+    write_test_job(job_id, preview_status="error", status="error", error="empty preview")
+    main.JOBS.clear()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_test_backend_only")
+
+    response = client.post(
+        "/api/create-checkout-session",
+        json={"job_id": job_id, "item_type": "song"},
+        headers=headers,
+    )
+
+    assert response.status_code == 409
 
 
 @pytest.mark.parametrize(

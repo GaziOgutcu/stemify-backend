@@ -110,8 +110,10 @@ app.add_middleware(
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
+JOBS_DIR = Path(os.getenv("JOBS_DIR", "jobs"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -220,6 +222,44 @@ PAID_ASSET_EVENTS: dict[str, threading.Event] = {}
 PAID_ASSET_LOCK = threading.Lock()
 
 
+def job_dir_for(job_id: str) -> Path:
+    return JOBS_DIR / job_id
+
+
+def job_json_path(job_id: str) -> Path:
+    return job_dir_for(job_id) / "job.json"
+
+
+def write_job_json(job: dict[str, Any]) -> None:
+    job_id = job["job_id"]
+    path = job_json_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(job, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def load_job_json(job_id: str) -> dict[str, Any]:
+    path = job_json_path(job_id)
+    if not path.is_file():
+        raise HTTPException(404, "Job not found")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(500, "Job metadata is corrupted.") from exc
+
+
+def find_job_by_checkout_session(checkout_session_id: str) -> dict[str, Any] | None:
+    for path in JOBS_DIR.glob("*/job.json"):
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if job.get("checkout_session_id") == checkout_session_id:
+            return job
+    return None
+
+
 class UserProfile(BaseModel):
     uid: str
     email: str
@@ -320,10 +360,18 @@ def current_user(
 
 
 def update_job(job_id: str, **values: Any) -> None:
+    job_for_disk = None
     with JOBS_LOCK:
         if job_id in JOBS:
             values.setdefault("updated_at", time.time())
             JOBS[job_id].update(values)
+            job_for_disk = JOBS[job_id].copy()
+    if job_for_disk is None and job_json_path(job_id).is_file():
+        job_for_disk = load_job_json(job_id)
+        values.setdefault("updated_at", time.time())
+        job_for_disk.update(values)
+    if job_for_disk is not None:
+        write_job_json(job_for_disk)
 
 
 def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -336,16 +384,22 @@ def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_authorized_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(404, "Job not found")
-        if job.get("user_uid") != user["uid"]:
-            raise HTTPException(404, "Job not found")
-        return serialize_job(job)
+    if job_json_path(job_id).is_file():
+        job = load_job_json(job_id)
+    else:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise HTTPException(404, "Job not found")
+            job = job.copy()
+    if job.get("user_uid") != user["uid"]:
+        raise HTTPException(404, "Job not found")
+    return serialize_job(job)
 
 
 def get_public_job(job_id: str) -> dict[str, Any]:
+    if job_json_path(job_id).is_file():
+        return serialize_job(load_job_json(job_id))
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
@@ -428,6 +482,11 @@ def enforce_paid_download(
     item_type: str,
     filename: str | None = None,
 ) -> None:
+    if (
+        job.get("payment_status") == "paid"
+        and job.get("full_processing_status") == "ready"
+    ):
+        return
     if is_download_paid(job["job_id"], user, item_type, filename):
         return
 
@@ -631,7 +690,8 @@ def prepare_output_files(
         )
 
     format_config = OUTPUT_FORMATS[output_format]
-    converted_dir = OUTPUT_DIR / job_id / output_scope / output_format
+    base_dir = job_dir_for(job_id) if job_dir_for(job_id).exists() else OUTPUT_DIR / job_id
+    converted_dir = base_dir / output_scope / output_format
     converted_dir.mkdir(parents=True, exist_ok=True)
     converted_files: list[Path] = []
 
@@ -882,6 +942,7 @@ async def health():
         "ffmpeg_available": shutil.which("ffmpeg") is not None,
         "upload_dir": str(UPLOAD_DIR),
         "output_dir": str(OUTPUT_DIR),
+        "jobs_dir": str(JOBS_DIR),
         "output_formats": sorted(OUTPUT_FORMATS),
         "qualities": sorted(QUALITY_SETTINGS),
     }
@@ -912,7 +973,15 @@ async def create_checkout_session(
     validate_checkout_configuration()
 
     job = get_authorized_job(payload.job_id, user)
-    enforce_job_done(job)
+    if job.get("preview_status") != "ready" and job.get("status") != "done":
+        raise HTTPException(
+            409,
+            {
+                "message": "Preview stems are not ready yet.",
+                "preview_status": job.get("preview_status"),
+                "status_detail": job.get("status_detail"),
+            },
+        )
     filename = None
 
     amount_cents, product_name = checkout_amount_for_job(job, payload.item_type)
@@ -970,6 +1039,11 @@ async def create_checkout_session(
             "currency": PAYMENT_CURRENCY,
         }
         USER_PAYMENT_JOBS.setdefault(user["uid"], set()).add(payload.job_id)
+    update_job(
+        payload.job_id,
+        checkout_session_id=session["id"],
+        payment_status="pending",
+    )
 
     return {"checkout_session_id": session["id"], "checkout_url": session.get("url")}
 
@@ -1041,18 +1115,26 @@ def mark_checkout_session_paid(
         if verification_source == "api":
             payment["stripe_api_verified"] = True
         USER_PAYMENT_JOBS.setdefault(user_uid, set()).add(job_id)
+    paid_job_updates = {
+        "paid": True,
+        "payment_status": "paid",
+        "paid_checkout_session_id": session_id,
+        "checkout_session_id": session_id,
+        "stripe_payment_intent": session.get("payment_intent"),
+        "updated_at": time.time(),
+    }
     should_start_paid_assets = False
     with JOBS_LOCK:
         if job_id in JOBS and JOBS[job_id].get("user_uid") == user_uid:
-            JOBS[job_id].update(
-                {
-                    "paid": True,
-                    "payment_status": "paid",
-                    "paid_checkout_session_id": session_id,
-                    "updated_at": time.time(),
-                }
-            )
+            JOBS[job_id].update(paid_job_updates)
             should_start_paid_assets = not JOBS[job_id].get("zip_url")
+    if job_json_path(job_id).is_file():
+        disk_job = load_job_json(job_id)
+        if disk_job.get("user_uid") == user_uid:
+            should_start_paid_assets = should_start_paid_assets or not disk_job.get(
+                "zip_url"
+            )
+            update_job(job_id, **paid_job_updates)
     if should_start_paid_assets:
         start_paid_assets_generation(job_id)
     with PAYMENTS_LOCK:
@@ -1088,6 +1170,8 @@ def ensure_paid_assets_ready(
     job = get_public_job(job_id)
     if job.get("zip_url"):
         return job
+    if job.get("payment_status") != "paid":
+        raise HTTPException(402, "Payment required before full processing.")
 
     if owns_processing:
         with PAID_ASSET_LOCK:
@@ -1119,6 +1203,26 @@ def ensure_paid_assets_ready(
         )
 
     try:
+        lock_path = job_dir_for(job_id) / "full_processing.lock"
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            owns_lock = True
+        except FileExistsError:
+            owns_lock = False
+        if not owns_lock:
+            deadline = time.time() + DEMUCS_TIMEOUT_SECONDS
+            while time.time() < deadline:
+                time.sleep(1)
+                latest_job = get_public_job(job_id)
+                if latest_job.get("full_processing_status") == "ready" and latest_job.get(
+                    "zip_path"
+                ):
+                    return latest_job
+                if latest_job.get("full_processing_status") == "error":
+                    raise HTTPException(500, latest_job.get("error") or "Full processing failed.")
+            raise HTTPException(409, "Full stems are still processing.")
+
         original_input_path = job.get("original_input_path")
         if not original_input_path:
             raise HTTPException(
@@ -1129,7 +1233,7 @@ def ensure_paid_assets_ready(
         if not input_path.is_file():
             raise HTTPException(410, "Original upload is no longer available.")
 
-        job_dir = OUTPUT_DIR / job_id
+        job_dir = job_dir_for(job_id)
         stems = int(job.get("requested_stems") or 2)
         track_name = job.get("track_name") or "track"
         output_format = job.get("output_format") or DEFAULT_OUTPUT_FORMAT
@@ -1194,6 +1298,15 @@ def ensure_paid_assets_ready(
         )
         if full_output_files != full_wavs:
             validate_audio_files(full_output_files, "Paid full stem")
+        full_dir = job_dir / "full"
+        full_dir.mkdir(parents=True, exist_ok=True)
+        persisted_full_files: list[Path] = []
+        for full_output_file in full_output_files:
+            persisted_file = full_dir / full_output_file.name
+            if full_output_file != persisted_file:
+                shutil.copy2(full_output_file, persisted_file)
+            persisted_full_files.append(persisted_file)
+        full_output_files = persisted_full_files
         for full_stem_file in full_output_files:
             validate_paid_download_file(
                 full_stem_file,
@@ -1214,7 +1327,8 @@ def ensure_paid_assets_ready(
             job_id,
             status="done",
             status_detail="Payment verified. Full paid stems and ZIP are ready.",
-            full_processing_status="done",
+            full_processing_status="ready",
+            full_stems=download_stem_urls,
             zip_url=f"/api/download/{job_id}/zip",
             full_stem_paths=path_map_for_job(full_stem_paths_by_name),
             download_stem_urls=download_stem_urls,
@@ -1226,6 +1340,8 @@ def ensure_paid_assets_ready(
         )
         return get_public_job(job_id)
     finally:
+        if "owns_lock" in locals() and owns_lock:
+            lock_path.unlink(missing_ok=True)
         event.set()
         with PAID_ASSET_LOCK:
             PAID_ASSET_EVENTS.pop(job_id, None)
@@ -1394,36 +1510,50 @@ async def split_audio(
         raise HTTPException(400, "Uploaded file is empty.")
 
     job_id = str(uuid.uuid4())
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id)
     job_dir.mkdir(parents=True, exist_ok=False)
+    input_dir = job_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
 
     safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(original_name).stem)[:80] or "track"
-    input_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    input_path = input_dir / original_name
     input_path.write_bytes(contents)
     now = time.time()
 
+    job_record = {
+        "job_id": job_id,
+        "original_filename": original_name,
+        "uploaded_file_path": str(input_path),
+        "preview_status": "processing",
+        "preview_stems": [],
+        "payment_status": "pending",
+        "checkout_session_id": None,
+        "stripe_payment_intent": None,
+        "full_processing_status": "not_started",
+        "full_stems": [],
+        "zip_path": None,
+        "error": None,
+        "created_at": now,
+        "updated_at": now,
+        "status": "processing",
+        "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
+        "stems": [],
+        "zip_url": None,
+        "stem_urls": {},
+        "track_name": safe_stem,
+        "user_uid": user["uid"],
+        "user_email": user["email"],
+        "requested_stems": stems,
+        "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
+        "output_format": output_format,
+        "quality": quality,
+        "started_at": now,
+        "paid": False,
+        "original_input_path": str(input_path),
+    }
+    write_job_json(job_record)
     with JOBS_LOCK:
-        JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "processing",
-            "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
-            "stems": [],
-            "zip_url": None,
-            "stem_urls": {},
-            "error": None,
-            "track_name": safe_stem,
-            "user_uid": user["uid"],
-            "user_email": user["email"],
-            "requested_stems": stems,
-            "preview_duration_seconds": PREVIEW_DURATION_SECONDS,
-            "output_format": output_format,
-            "quality": quality,
-            "started_at": now,
-            "updated_at": now,
-            "payment_status": "pending",
-            "paid": False,
-            "original_input_path": str(input_path),
-        }
+        JOBS[job_id] = job_record.copy()
     with AUTH_LOCK:
         user["jobs_created"] += 1
         user["stem_count"] += stems
@@ -1561,9 +1691,10 @@ def run_demucs(
             print(f"[JOB {job_id[:8]}] FAILED:\n{err[-800:]}")
             update_job(
                 job_id,
-                status="error",
-                status_detail="Preview stem separation failed.",
-                error=f"Demucs error: {err[-400:]}",
+            status="error",
+            preview_status="error",
+            status_detail="Preview stem separation failed.",
+            error=f"Demucs error: {err[-400:]}",
             )
             return
 
@@ -1583,6 +1714,7 @@ def run_demucs(
             update_job(
                 job_id,
                 status="error",
+                preview_status="error",
                 status_detail="Preview stem separation finished without the expected stem files.",
                 error=(
                     "Missing Demucs output files: "
@@ -1611,8 +1743,10 @@ def run_demucs(
         update_job(
             job_id,
             status="done",
+            preview_status="ready",
             status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready. Complete payment to generate full stems and ZIP.",
             stems=stem_names,
+            preview_stems=preview_urls,
             zip_url=None,
             stem_urls=preview_urls,
             preview_urls=preview_urls,
@@ -1631,6 +1765,7 @@ def run_demucs(
         update_job(
             job_id,
             status="error",
+            preview_status="error",
             status_detail="Preview stem separation timed out.",
             error=f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds. Try a shorter track.",
         )
@@ -1638,6 +1773,7 @@ def run_demucs(
         update_job(
             job_id,
             status="error",
+            preview_status="error",
             status_detail="Preview stem separation crashed.",
             error=str(exc),
         )
@@ -1665,7 +1801,7 @@ async def preview_stem(job_id: str, filename: str):
     if f"/api/preview/{job_id}/stem/{filename}" not in preview_urls.values():
         raise HTTPException(404, "Preview stem not found.")
 
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
@@ -1700,7 +1836,7 @@ async def download_zip(
     job = get_authorized_job(job_id, user)
     enforce_job_done(job)
     enforce_paid_download(job, user, "zip")
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
     zip_path = Path(job["zip_path"]) if job.get("zip_path") else None
@@ -1725,7 +1861,7 @@ async def download_stem(
     job = get_authorized_job(job_id, user)
     enforce_job_done(job)
     enforce_paid_download(job, user, "stem", filename)
-    job_dir = OUTPUT_DIR / job_id
+    job_dir = job_dir_for(job_id) if job_dir_for(job_id).is_dir() else OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
