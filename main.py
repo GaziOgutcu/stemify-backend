@@ -216,6 +216,8 @@ AUTH_LOCK = threading.Lock()
 PAYMENTS: dict[str, dict[str, Any]] = {}
 USER_PAYMENT_JOBS: dict[str, set[str]] = {}
 PAYMENTS_LOCK = threading.Lock()
+PAID_ASSET_EVENTS: dict[str, threading.Event] = {}
+PAID_ASSET_LOCK = threading.Lock()
 
 
 class UserProfile(BaseModel):
@@ -1039,6 +1041,7 @@ def mark_checkout_session_paid(
         if verification_source == "api":
             payment["stripe_api_verified"] = True
         USER_PAYMENT_JOBS.setdefault(user_uid, set()).add(job_id)
+    should_start_paid_assets = False
     with JOBS_LOCK:
         if job_id in JOBS and JOBS[job_id].get("user_uid") == user_uid:
             JOBS[job_id].update(
@@ -1049,113 +1052,183 @@ def mark_checkout_session_paid(
                     "updated_at": time.time(),
                 }
             )
+            should_start_paid_assets = not JOBS[job_id].get("zip_url")
+    if should_start_paid_assets:
+        start_paid_assets_generation(job_id)
+    with PAYMENTS_LOCK:
         return payment.copy()
 
 
-def ensure_paid_assets_ready(job_id: str) -> dict[str, Any]:
+def start_paid_assets_generation(job_id: str) -> None:
+    with PAID_ASSET_LOCK:
+        if job_id in PAID_ASSET_EVENTS:
+            return
+        PAID_ASSET_EVENTS[job_id] = threading.Event()
+
+    thread = threading.Thread(
+        target=_paid_assets_worker,
+        args=(job_id,),
+        daemon=True,
+    )
+    thread.start()
+
+
+def _paid_assets_worker(job_id: str) -> None:
+    try:
+        ensure_paid_assets_ready(job_id, owns_processing=True)
+    except Exception as exc:
+        audio_logger.exception(
+            "Paid full stem generation failed job_id=%s error=%s", job_id, exc
+        )
+
+
+def ensure_paid_assets_ready(
+    job_id: str, owns_processing: bool = False
+) -> dict[str, Any]:
     job = get_public_job(job_id)
     if job.get("zip_url"):
         return job
 
-    original_input_path = job.get("original_input_path")
-    if not original_input_path:
-        raise HTTPException(409, "Original upload is not available for full processing.")
+    if owns_processing:
+        with PAID_ASSET_LOCK:
+            event = PAID_ASSET_EVENTS.get(job_id)
+            if event is None:
+                event = threading.Event()
+                PAID_ASSET_EVENTS[job_id] = event
+    else:
+        with PAID_ASSET_LOCK:
+            event = PAID_ASSET_EVENTS.get(job_id)
+            if event is None:
+                event = threading.Event()
+                PAID_ASSET_EVENTS[job_id] = event
+                owns_processing = True
 
-    input_path = Path(original_input_path)
-    if not input_path.is_file():
-        raise HTTPException(410, "Original upload is no longer available.")
-
-    job_dir = OUTPUT_DIR / job_id
-    stems = int(job.get("requested_stems") or 2)
-    track_name = job.get("track_name") or "track"
-    output_format = job.get("output_format") or DEFAULT_OUTPUT_FORMAT
-    quality = normalize_quality(job.get("quality") or DEFAULT_QUALITY)
-    source_duration = job.get("source_duration_seconds")
-
-    update_job(
-        job_id,
-        status_detail=f"Payment verified. Separating the full track with {demucs_model_for_quality(stems, quality)} ({quality} quality).",
-    )
-    full_cmd = build_demucs_command(job_dir, input_path, stems, quality)
-    env = demucs_subprocess_env()
-    full_demucs_dir = demucs_output_dir(job_dir, input_path, stems, quality)
-    audio_logger.info(
-        "Prepared paid full Demucs job job_id=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
-        job_id,
-        " ".join(full_cmd),
-        full_demucs_dir,
-        input_path,
-        input_path.stat().st_size,
-    )
-    with DEMUCS_SEMAPHORE:
-        proc = subprocess.run(
-            full_cmd,
-            capture_output=True,
-            text=True,
-            timeout=DEMUCS_TIMEOUT_SECONDS,
-            env=env,
+    if not owns_processing:
+        event.wait(timeout=DEMUCS_TIMEOUT_SECONDS + 120)
+        job = get_public_job(job_id)
+        if job.get("zip_url"):
+            return job
+        raise HTTPException(
+            409,
+            {
+                "message": "Full stems are still processing after payment verification.",
+                "status": job.get("status"),
+                "status_detail": job.get("status_detail"),
+                "full_processing_status": job.get("full_processing_status"),
+            },
         )
-    print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
-    print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
-    print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
 
-    if proc.returncode != 0:
-        err = (proc.stderr or "") + (proc.stdout or "")
+    try:
+        original_input_path = job.get("original_input_path")
+        if not original_input_path:
+            raise HTTPException(
+                409, "Original upload is not available for full processing."
+            )
+
+        input_path = Path(original_input_path)
+        if not input_path.is_file():
+            raise HTTPException(410, "Original upload is no longer available.")
+
+        job_dir = OUTPUT_DIR / job_id
+        stems = int(job.get("requested_stems") or 2)
+        track_name = job.get("track_name") or "track"
+        output_format = job.get("output_format") or DEFAULT_OUTPUT_FORMAT
+        quality = normalize_quality(job.get("quality") or DEFAULT_QUALITY)
+        source_duration = job.get("source_duration_seconds")
+
         update_job(
             job_id,
-            status="error",
-            status_detail="Full stem separation failed after payment verification.",
-            error=f"Demucs error: {err[-400:]}",
+            status_detail=f"Payment verified. Separating the full track with {demucs_model_for_quality(stems, quality)} ({quality} quality).",
+            full_processing_status="processing",
         )
-        raise HTTPException(500, "Full stem separation failed.")
+        full_cmd = build_demucs_command(job_dir, input_path, stems, quality)
+        env = demucs_subprocess_env()
+        full_demucs_dir = demucs_output_dir(job_dir, input_path, stems, quality)
+        audio_logger.info(
+            "Prepared paid full Demucs job job_id=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
+            job_id,
+            " ".join(full_cmd),
+            full_demucs_dir,
+            input_path,
+            input_path.stat().st_size,
+        )
+        with DEMUCS_SEMAPHORE:
+            proc = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=DEMUCS_TIMEOUT_SECONDS,
+                env=env,
+            )
+        print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
 
-    full_wavs = expected_demucs_stem_files(job_dir, input_path, stems, quality)
-    missing_full_wavs = [path for path in full_wavs if not path.is_file()]
-    if missing_full_wavs:
+        if proc.returncode != 0:
+            err = (proc.stderr or "") + (proc.stdout or "")
+            update_job(
+                job_id,
+                status_detail="Full stem separation failed after payment verification.",
+                full_processing_status="error",
+                full_processing_error=f"Demucs error: {err[-400:]}",
+            )
+            raise HTTPException(500, "Full stem separation failed.")
+
+        full_wavs = expected_demucs_stem_files(job_dir, input_path, stems, quality)
+        missing_full_wavs = [path for path in full_wavs if not path.is_file()]
+        if missing_full_wavs:
+            update_job(
+                job_id,
+                status_detail="Full stem separation finished without the expected stem files.",
+                full_processing_status="error",
+                full_processing_error=(
+                    "Missing Demucs output files: "
+                    + ", ".join(str(path) for path in missing_full_wavs)
+                ),
+            )
+            raise HTTPException(500, "Full stem separation did not create all stems.")
+        validate_audio_files(full_wavs, "Demucs full stem")
+
+        full_output_files = prepare_output_files(
+            job_id, full_wavs, output_format, "full"
+        )
+        if full_output_files != full_wavs:
+            validate_audio_files(full_output_files, "Paid full stem")
+        for full_stem_file in full_output_files:
+            validate_paid_download_file(
+                full_stem_file,
+                {"source_duration_seconds": source_duration},
+                "Paid full stem",
+            )
+
+        zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
+        create_zip(zip_path, full_output_files)
+        reject_preview_paid_path(zip_path)
+
+        download_stem_urls = {
+            public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
+            for stem_file in full_output_files
+        }
+        full_stem_paths_by_name = output_files_by_public_name(full_output_files)
         update_job(
             job_id,
-            status="error",
-            status_detail="Full stem separation finished without the expected stem files.",
-            error=(
-                "Missing Demucs output files: "
-                + ", ".join(str(path) for path in missing_full_wavs)
-            ),
+            status="done",
+            status_detail="Payment verified. Full paid stems and ZIP are ready.",
+            full_processing_status="done",
+            zip_url=f"/api/download/{job_id}/zip",
+            full_stem_paths=path_map_for_job(full_stem_paths_by_name),
+            download_stem_urls=download_stem_urls,
+            download_urls={
+                "zip": f"/api/download/{job_id}/zip",
+                "stems": download_stem_urls,
+            },
+            zip_path=str(zip_path),
         )
-        raise HTTPException(500, "Full stem separation did not create all stems.")
-    validate_audio_files(full_wavs, "Demucs full stem")
-
-    full_output_files = prepare_output_files(job_id, full_wavs, output_format, "full")
-    validate_audio_files(full_output_files, "Paid full stem")
-    for full_stem_file in full_output_files:
-        validate_paid_download_file(
-            full_stem_file,
-            {"source_duration_seconds": source_duration},
-            "Paid full stem",
-        )
-
-    zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
-    create_zip(zip_path, full_output_files)
-    reject_preview_paid_path(zip_path)
-
-    download_stem_urls = {
-        public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
-        for stem_file in full_output_files
-    }
-    full_stem_paths_by_name = output_files_by_public_name(full_output_files)
-    update_job(
-        job_id,
-        status="done",
-        status_detail="Payment verified. Full paid stems and ZIP are ready.",
-        zip_url=f"/api/download/{job_id}/zip",
-        full_stem_paths=path_map_for_job(full_stem_paths_by_name),
-        download_stem_urls=download_stem_urls,
-        download_urls={
-            "zip": f"/api/download/{job_id}/zip",
-            "stems": download_stem_urls,
-        },
-        zip_path=str(zip_path),
-    )
-    return get_public_job(job_id)
+        return get_public_job(job_id)
+    finally:
+        event.set()
+        with PAID_ASSET_LOCK:
+            PAID_ASSET_EVENTS.pop(job_id, None)
 
 
 def payment_verification_response(

@@ -514,6 +514,35 @@ def test_stripe_webhook_marks_payment_paid(monkeypatch):
     assert main.PAYMENTS["cs_paid"]["status"] == "paid"
 
 
+def test_paid_checkout_starts_full_generation_in_background(monkeypatch):
+    main.JOBS["paid-background-job"] = {
+        "job_id": "paid-background-job",
+        "user_uid": "test-uid",
+        "status": "done",
+        "zip_url": None,
+    }
+    started_jobs = []
+    monkeypatch.setattr(
+        main, "start_paid_assets_generation", lambda job_id: started_jobs.append(job_id)
+    )
+
+    payment = main.mark_checkout_session_paid(
+        {
+            "id": "cs_background_paid",
+            "payment_status": "paid",
+            "metadata": {
+                "job_id": "paid-background-job",
+                "item_type": "song",
+                "user_uid": "test-uid",
+            },
+        },
+        verification_source="webhook",
+    )
+
+    assert payment["status"] == "paid"
+    assert started_jobs == ["paid-background-job"]
+
+
 def test_requirements_include_diffq_for_quantized_demucs_model():
     requirements = Path("requirements.txt").read_text()
 
