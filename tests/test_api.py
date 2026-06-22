@@ -401,7 +401,9 @@ def test_payment_verify_get_marks_job_paid_and_returns_download_urls(monkeypatch
         "user_uid": "test-uid",
         "status": "done",
         "zip_url": f"/api/download/{job_id}/zip",
-        "stem_urls": {"vocals": f"/api/download/{job_id}/stem/vocals.wav"},
+        "stem_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.wav"},
+        "preview_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.wav"},
+        "download_stem_urls": {"vocals": f"/api/download/{job_id}/stem/vocals.wav"},
     }
 
     def fake_retrieve_checkout_session(checkout_session_id):
@@ -434,6 +436,11 @@ def test_payment_verify_get_marks_job_paid_and_returns_download_urls(monkeypatch
     assert payload["status"] == "paid"
     assert payload["payment_status"] == "paid"
     assert payload["download_urls"]["zip"] == f"/api/download/{job_id}/zip"
+    assert payload["stem_urls"] == {"vocals": f"/api/download/{job_id}/stem/vocals.wav"}
+    assert payload["download_urls"]["stems"] == {
+        "vocals": f"/api/download/{job_id}/stem/vocals.wav"
+    }
+    assert "/api/preview/" not in json.dumps(payload["download_urls"])
     assert main.JOBS[job_id]["paid"] is True
     assert main.JOBS[job_id]["payment_status"] == "paid"
 
@@ -632,6 +639,10 @@ def test_run_demucs_publishes_free_preview_urls(tmp_path, monkeypatch):
     demucs_dir.mkdir(parents=True)
     (demucs_dir / "vocals.wav").write_bytes(b"v" * 2048)
     (demucs_dir / "no_vocals.wav").write_bytes(b"i" * 2048)
+    full_demucs_dir = job_dir / "mdx_q" / input_path.stem
+    full_demucs_dir.mkdir(parents=True)
+    (full_demucs_dir / "vocals.wav").write_bytes(b"full-v" * 2048)
+    (full_demucs_dir / "no_vocals.wav").write_bytes(b"full-i" * 2048)
     main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
 
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
@@ -660,6 +671,10 @@ def test_run_demucs_publishes_free_preview_urls(tmp_path, monkeypatch):
         "instrumental": f"/api/download/{job_id}/stem/no_vocals.wav",
         "vocals": f"/api/download/{job_id}/stem/vocals.wav",
     }
+    assert main.JOBS[job_id]["preview_stem_paths"]["vocals"].endswith(
+        f"{job_id}_preview/vocals.wav"
+    )
+    assert main.JOBS[job_id]["full_stem_paths"]["vocals"].endswith("input/vocals.wav")
 
 
 def test_split_requires_authentication():
@@ -807,6 +822,7 @@ def test_split_accepts_multipart_quality_and_output_format_defaults(
     assert main.JOBS[payload["job_id"]]["quality"] == expected_quality
     client.delete(f"/api/cleanup/{payload['job_id']}", headers=headers)
 
+
 def test_download_stem_rejects_invalid_filename():
     response = client.get(
         "/api/download/example/stem/..%2Fsecret.wav", headers=auth_headers()
@@ -853,6 +869,36 @@ def test_download_zip_returns_ready_archive(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
+
+
+def test_download_zip_returns_recorded_full_archive(tmp_path, monkeypatch):
+    job_id = "full-zip-test"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    job_dir = tmp_path / job_id
+    preview_dir = job_dir / "mdx_q" / f"{job_id}_preview"
+    full_dir = job_dir / "mdx_q" / "input"
+    preview_dir.mkdir(parents=True)
+    full_dir.mkdir(parents=True)
+    (preview_dir / "vocals.wav").write_bytes(b"preview-vocals")
+    (full_dir / "vocals.wav").write_bytes(b"full-vocals")
+    zip_path = job_dir / "stemify_song_wav.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.write(full_dir / "vocals.wav", arcname="vocals.wav")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "zip_path": str(zip_path),
+    }
+
+    response = client.get(f"/api/download/{job_id}/zip", headers=headers)
+
+    assert response.status_code == 200
+    downloaded_zip = tmp_path / "downloaded.zip"
+    downloaded_zip.write_bytes(response.content)
+    with zipfile.ZipFile(downloaded_zip) as archive:
+        assert archive.read("vocals.wav") == b"full-vocals"
 
 
 def test_download_zip_reports_not_ready_for_processing_job(tmp_path, monkeypatch):
@@ -962,3 +1008,49 @@ def test_download_zip_allowed_after_webhook_confirms_payment(tmp_path, monkeypat
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
+
+
+def test_download_stem_serves_recorded_full_path_not_preview(tmp_path, monkeypatch):
+    job_id = "full-stem-test"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    job_dir = tmp_path / job_id
+    preview_dir = job_dir / "mdx_q" / f"{job_id}_preview"
+    full_dir = job_dir / "mdx_q" / "input"
+    preview_dir.mkdir(parents=True)
+    full_dir.mkdir(parents=True)
+    (preview_dir / "vocals.wav").write_bytes(b"preview-vocals")
+    full_stem = full_dir / "vocals.wav"
+    full_stem.write_bytes(b"full-vocals")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "full_stem_paths": {"vocals": str(full_stem)},
+    }
+
+    response = client.get(f"/api/download/{job_id}/stem/vocals.wav", headers=headers)
+
+    assert response.status_code == 200
+    assert response.content == b"full-vocals"
+
+
+def test_download_stem_rejects_recorded_preview_path(tmp_path, monkeypatch):
+    job_id = "reject-preview-stem-test"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    preview_dir = tmp_path / job_id / "mdx_q" / f"{job_id}_preview"
+    preview_dir.mkdir(parents=True)
+    preview_stem = preview_dir / "vocals.wav"
+    preview_stem.write_bytes(b"preview-vocals")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "full_stem_paths": {"vocals": str(preview_stem)},
+    }
+
+    response = client.get(f"/api/download/{job_id}/stem/vocals.wav", headers=headers)
+
+    assert response.status_code == 500
+    assert "preview file" in response.json()["detail"]

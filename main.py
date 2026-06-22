@@ -617,7 +617,7 @@ def create_preview_input(job_id: str, input_path: Path) -> Path:
 
 
 def prepare_output_files(
-    job_id: str, wavs: list[Path], output_format: str
+    job_id: str, wavs: list[Path], output_format: str, output_scope: str = "preview"
 ) -> list[Path]:
     if output_format == "wav":
         return wavs
@@ -629,7 +629,7 @@ def prepare_output_files(
         )
 
     format_config = OUTPUT_FORMATS[output_format]
-    converted_dir = OUTPUT_DIR / job_id / output_format
+    converted_dir = OUTPUT_DIR / job_id / output_scope / output_format
     converted_dir.mkdir(parents=True, exist_ok=True)
     converted_files: list[Path] = []
 
@@ -648,9 +648,10 @@ def prepare_output_files(
         if proc.returncode != 0:
             err = (proc.stderr or "") + (proc.stdout or "")
             raise RuntimeError(f"{output_format.upper()} export failed: {err[-400:]}")
-        validate_audio_file(converted, f"{output_format.upper()} preview stem")
+        validate_audio_file(converted, f"{output_format.upper()} {output_scope} stem")
         audio_logger.info(
-            "Generated encoded preview stem job_id=%s path=%s size_bytes=%s",
+            "Generated encoded %s stem job_id=%s path=%s size_bytes=%s",
+            output_scope,
             job_id,
             converted,
             converted.stat().st_size,
@@ -675,15 +676,15 @@ def demucs_model_for_quality(stems: int, quality: str = "fast") -> str:
 
 
 def demucs_output_dir(
-    job_dir: Path, preview_path: Path, stems: int, quality: str = "fast"
+    job_dir: Path, input_audio_path: Path, stems: int, quality: str = "fast"
 ) -> Path:
-    return job_dir / demucs_model_for_quality(stems, quality) / preview_path.stem
+    return job_dir / demucs_model_for_quality(stems, quality) / input_audio_path.stem
 
 
 def expected_demucs_stem_files(
-    job_dir: Path, preview_path: Path, stems: int, quality: str = "fast"
+    job_dir: Path, input_audio_path: Path, stems: int, quality: str = "fast"
 ) -> list[Path]:
-    output_dir = demucs_output_dir(job_dir, preview_path, stems, quality)
+    output_dir = demucs_output_dir(job_dir, input_audio_path, stems, quality)
     if stems == 2:
         return [output_dir / "vocals.wav", output_dir / "no_vocals.wav"]
     return sorted(output_dir.glob("*.wav"))
@@ -789,6 +790,45 @@ def validate_audio_file(path: Path, label: str) -> dict[str, float | int | None]
         rms_db,
     )
     return {"size_bytes": size, "duration_seconds": duration, "mean_volume_db": rms_db}
+
+
+def output_files_by_public_name(paths: list[Path]) -> dict[str, Path]:
+    return {public_stem_name(path): path for path in paths}
+
+
+def path_map_for_job(paths_by_name: dict[str, Path]) -> dict[str, str]:
+    return {name: str(path) for name, path in paths_by_name.items()}
+
+
+def create_zip(zip_path: Path, stem_files: list[Path]) -> Path:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for stem_file in stem_files:
+            zf.write(stem_file, arcname=stem_file.name)
+    return zip_path
+
+
+def get_recorded_path(job: dict[str, Any], key: str, public_name: str) -> Path | None:
+    recorded = (job.get(key) or {}).get(public_name)
+    return Path(recorded) if recorded else None
+
+
+def reject_preview_paid_path(path: Path) -> None:
+    if "_preview" in path.stem or any(
+        part.lower() == "preview" or part.lower().endswith("_preview")
+        for part in path.parts
+    ):
+        raise HTTPException(500, "Paid download resolved to a preview file.")
+
+
+def validate_paid_download_file(path: Path, job: dict[str, Any], label: str) -> None:
+    if not path.is_file():
+        raise HTTPException(404, f"{label} not found.")
+    reject_preview_paid_path(path)
+    source_duration = job.get("source_duration_seconds")
+    if source_duration and source_duration > PREVIEW_DURATION_SECONDS:
+        duration = audio_duration_seconds(path)
+        if duration <= PREVIEW_DURATION_SECONDS:
+            raise HTTPException(500, f"{label} resolved to a preview-length file.")
 
 
 def validate_audio_files(paths: list[Path], label: str) -> None:
@@ -1027,11 +1067,14 @@ def payment_verification_response(
         response.update(
             {
                 "zip_url": job.get("zip_url"),
-                "stem_urls": job.get("stem_urls", {}),
-                "download_urls": {
-                    "zip": job.get("zip_url"),
-                    "stems": job.get("download_stem_urls", job.get("stem_urls", {})),
-                },
+                "stem_urls": job.get("download_stem_urls", {}),
+                "download_urls": job.get(
+                    "download_urls",
+                    {
+                        "zip": job.get("zip_url"),
+                        "stems": job.get("download_stem_urls", {}),
+                    },
+                ),
             }
         )
     return response
@@ -1227,7 +1270,7 @@ async def split_audio(
 
 
 def build_demucs_command(
-    job_dir: Path, preview_path: Path, stems: int, quality: str = "fast"
+    job_dir: Path, input_audio_path: Path, stems: int, quality: str = "fast"
 ) -> list[str]:
     settings = QUALITY_SETTINGS[normalize_quality(quality)]
     cmd = [
@@ -1251,7 +1294,7 @@ def build_demucs_command(
         cmd += ["--device", settings["device"]]
     if stems == 2:
         cmd += ["--two-stems", "vocals"]
-    cmd.append(str(preview_path))
+    cmd.append(str(input_audio_path))
     return cmd
 
 
@@ -1283,6 +1326,16 @@ def run_demucs(
         audio_logger.info(
             "Starting preview split job_id=%s input_path=%s", job_id, input_path
         )
+        try:
+            source_duration = audio_duration_seconds(input_path)
+        except RuntimeError as exc:
+            source_duration = None
+            audio_logger.warning(
+                "Could not determine source duration job_id=%s path=%s error=%s",
+                job_id,
+                input_path,
+                exc,
+            )
         preview_path = create_preview_input(job_id, input_path)
         cmd = build_demucs_command(job_dir, preview_path, stems, quality)
         env = demucs_subprocess_env()
@@ -1338,7 +1391,7 @@ def run_demucs(
         )
         wavs = expected_demucs_stem_files(job_dir, preview_path, stems, quality)
         audio_logger.info(
-            "Checking Demucs output job_id=%s output_dir=%s generated_stems=%s",
+            "Checking Demucs preview output job_id=%s output_dir=%s generated_stems=%s",
             job_id,
             demucs_dir,
             [str(path) for path in wavs],
@@ -1357,37 +1410,112 @@ def run_demucs(
             return
         validate_audio_files(wavs, "Demucs preview stem")
 
-        output_files = prepare_output_files(job_id, wavs, output_format)
-        validate_audio_files(output_files, "Browser preview stem")
+        preview_output_files = prepare_output_files(
+            job_id, wavs, output_format, "preview"
+        )
+        validate_audio_files(preview_output_files, "Browser preview stem")
         audio_logger.info(
             "Prepared browser preview stems job_id=%s preview_files=%s file_sizes=%s",
             job_id,
-            [str(path) for path in output_files],
-            {path.name: path.stat().st_size for path in output_files},
+            [str(path) for path in preview_output_files],
+            {path.name: path.stat().st_size for path in preview_output_files},
         )
-        zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for stem_file in output_files:
-                zf.write(stem_file, arcname=stem_file.name)
 
-        stem_names = [public_stem_name(stem_file) for stem_file in output_files]
+        update_job(
+            job_id,
+            status_detail=f"Separating the full track with {demucs_model_for_quality(stems, quality)} ({quality} quality).",
+        )
+        full_cmd = build_demucs_command(job_dir, input_path, stems, quality)
+        full_demucs_dir = demucs_output_dir(job_dir, input_path, stems, quality)
+        audio_logger.info(
+            "Prepared full Demucs job job_id=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
+            job_id,
+            " ".join(full_cmd),
+            full_demucs_dir,
+            input_path,
+            input_path.stat().st_size,
+        )
+        with DEMUCS_SEMAPHORE:
+            proc = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=DEMUCS_TIMEOUT_SECONDS,
+                env=env,
+            )
+        print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
+
+        if proc.returncode != 0:
+            err = (proc.stderr or "") + (proc.stdout or "")
+            update_job(
+                job_id,
+                status="error",
+                status_detail="Full stem separation failed.",
+                error=f"Demucs error: {err[-400:]}",
+            )
+            return
+
+        full_wavs = expected_demucs_stem_files(job_dir, input_path, stems, quality)
+        missing_full_wavs = [path for path in full_wavs if not path.is_file()]
+        if missing_full_wavs:
+            update_job(
+                job_id,
+                status="error",
+                status_detail="Full stem separation finished without the expected stem files.",
+                error=(
+                    "Missing Demucs output files: "
+                    + ", ".join(str(path) for path in missing_full_wavs)
+                ),
+            )
+            return
+        validate_audio_files(full_wavs, "Demucs full stem")
+
+        full_output_files = prepare_output_files(
+            job_id, full_wavs, output_format, "full"
+        )
+        validate_audio_files(full_output_files, "Paid full stem")
+        for full_stem_file in full_output_files:
+            validate_paid_download_file(
+                full_stem_file,
+                {"source_duration_seconds": source_duration},
+                "Paid full stem",
+            )
+
+        zip_path = job_dir / f"stemify_{track_name}_{output_format}.zip"
+        create_zip(zip_path, full_output_files)
+        reject_preview_paid_path(zip_path)
+
+        stem_names = [public_stem_name(stem_file) for stem_file in preview_output_files]
         preview_urls = {
             public_stem_name(stem_file): f"/api/preview/{job_id}/stem/{stem_file.name}"
-            for stem_file in output_files
+            for stem_file in preview_output_files
         }
         download_stem_urls = {
             public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
-            for stem_file in output_files
+            for stem_file in full_output_files
         }
+        full_stem_paths_by_name = output_files_by_public_name(full_output_files)
         update_job(
             job_id,
             status="done",
-            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready.",
+            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview and full paid stems are ready.",
             stems=stem_names,
             zip_url=f"/api/download/{job_id}/zip",
             stem_urls=preview_urls,
             preview_urls=preview_urls,
+            preview_stem_paths=path_map_for_job(
+                output_files_by_public_name(preview_output_files)
+            ),
+            full_stem_paths=path_map_for_job(full_stem_paths_by_name),
             download_stem_urls=download_stem_urls,
+            download_urls={
+                "zip": f"/api/download/{job_id}/zip",
+                "stems": download_stem_urls,
+            },
+            zip_path=str(zip_path),
+            source_duration_seconds=source_duration,
             output_format=output_format,
             quality=quality,
         )
@@ -1436,20 +1564,28 @@ async def preview_stem(job_id: str, filename: str):
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
-    matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
-    if not matches:
+    public_name = public_stem_name(Path(filename))
+    recorded_path = get_recorded_path(job, "preview_stem_paths", public_name)
+    if recorded_path and recorded_path.name == filename and recorded_path.is_file():
+        stem_path = recorded_path
+    else:
+        matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
+        if not matches:
+            raise HTTPException(404, "Preview stem not found.")
+        stem_path = matches[0]
+    if not stem_path.is_file():
         raise HTTPException(404, "Preview stem not found.")
-    extension = matches[0].suffix.lower().lstrip(".")
+    extension = stem_path.suffix.lower().lstrip(".")
     media_type = OUTPUT_FORMATS.get(extension, OUTPUT_FORMATS["wav"])["media_type"]
     audio_logger.info(
         "Serving preview stem job_id=%s filename=%s path=%s media_type=%s size_bytes=%s",
         job_id,
         filename,
-        matches[0],
+        stem_path,
         media_type,
-        matches[0].stat().st_size,
+        stem_path.stat().st_size,
     )
-    return FileResponse(matches[0], media_type=media_type, filename=filename)
+    return FileResponse(stem_path, media_type=media_type, filename=filename)
 
 
 @app.get("/api/download/{job_id}/zip")
@@ -1462,10 +1598,14 @@ async def download_zip(
     job_dir = OUTPUT_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
-    zips = sorted(job_dir.glob("*.zip"))
-    if not zips:
+    zip_path = Path(job["zip_path"]) if job.get("zip_path") else None
+    if zip_path is None:
+        zips = sorted(job_dir.glob("*.zip"))
+        zip_path = zips[0] if zips else None
+    if zip_path is None or not zip_path.is_file():
         raise HTTPException(404, "ZIP not ready yet.")
-    return FileResponse(zips[0], media_type="application/zip", filename=zips[0].name)
+    reject_preview_paid_path(zip_path)
+    return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
 
 
 @app.get("/api/download/{job_id}/stem/{filename}")
@@ -1484,12 +1624,17 @@ async def download_stem(
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found.")
 
-    matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
-    if not matches:
+    public_name = public_stem_name(Path(filename))
+    stem_path = get_recorded_path(job, "full_stem_paths", public_name)
+    if stem_path is None or stem_path.name != filename:
+        matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
+        stem_path = matches[0] if matches else None
+    if stem_path is None:
         raise HTTPException(404, "Stem not found.")
-    extension = matches[0].suffix.lower().lstrip(".")
+    validate_paid_download_file(stem_path, job, "Stem")
+    extension = stem_path.suffix.lower().lstrip(".")
     media_type = OUTPUT_FORMATS.get(extension, OUTPUT_FORMATS["wav"])["media_type"]
-    return FileResponse(matches[0], media_type=media_type, filename=filename)
+    return FileResponse(stem_path, media_type=media_type, filename=filename)
 
 
 @app.delete("/api/cleanup/{job_id}")
