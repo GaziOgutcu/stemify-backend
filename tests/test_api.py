@@ -133,6 +133,7 @@ def test_create_checkout_session_available_on_frontend_endpoint(monkeypatch):
         "job_id": job_id,
         "user_uid": "test-uid",
         "status": "done",
+        "preview_status": "ready",
         "requested_stems": 2,
     }
 
@@ -165,6 +166,7 @@ def test_create_checkout_session_uses_legacy_payments_endpoint(monkeypatch):
         "job_id": job_id,
         "user_uid": "test-uid",
         "status": "done",
+        "preview_status": "ready",
         "requested_stems": 2,
     }
 
@@ -203,6 +205,7 @@ def test_checkout_uses_static_frontend_root_redirects(monkeypatch):
         "job_id": job_id,
         "user_uid": "test-uid",
         "status": "done",
+        "preview_status": "ready",
         "requested_stems": 2,
     }
 
@@ -239,6 +242,7 @@ def test_checkout_can_return_to_frontend_download_route(monkeypatch):
         "job_id": job_id,
         "user_uid": "test-uid",
         "status": "done",
+        "preview_status": "ready",
         "requested_stems": 2,
     }
 
@@ -274,6 +278,7 @@ def test_checkout_rejects_absolute_return_path(monkeypatch):
         "job_id": job_id,
         "user_uid": "test-uid",
         "status": "done",
+        "preview_status": "ready",
         "requested_stems": 2,
     }
 
@@ -691,7 +696,11 @@ def test_run_demucs_fails_when_expected_stems_are_missing(tmp_path, monkeypatch)
     input_path.write_bytes(b"audio")
     preview_path = tmp_path / f"{job_id}_preview.wav"
     preview_path.write_bytes(b"preview" * 400)
-    main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "processing",
+    }
 
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
@@ -795,7 +804,11 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(
     demucs_dir.mkdir(parents=True)
     (demucs_dir / "vocals.wav").write_bytes(b"v" * 2048)
     (demucs_dir / "no_vocals.wav").write_bytes(b"i" * 2048)
-    main.JOBS[job_id] = {"job_id": job_id, "status": "processing"}
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "processing",
+    }
 
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     monkeypatch.setitem(main.STEM_MODELS, 2, "mdx_q")
@@ -865,6 +878,13 @@ def test_run_demucs_publishes_free_preview_urls_without_full_processing(
     assert all(call[-1].endswith(".mp3") for call in ffmpeg_calls)
     assert str(preview_path) in demucs_calls[0]
     assert str(input_path) not in demucs_calls[0]
+
+    job_response = client.get(f"/api/job/{job_id}", headers=auth_headers())
+    assert job_response.status_code == 200
+    preview_url = job_response.json()["preview_stems"]["vocals"]
+    preview_response = client.get(preview_url)
+    assert preview_response.status_code == 200
+    assert preview_response.headers["content-type"] == "audio/mpeg"
 
 
 def test_split_requires_authentication():
@@ -1003,6 +1023,45 @@ def test_job_status_survives_cleared_memory_cache():
     assert payload["preview_debug"]["sizes_bytes"]["vocals"] > 0
 
 
+def test_debug_job_reports_preview_mp3_metadata(tmp_path):
+    job_id = "debug-preview-job"
+    mp3_path = str(tmp_path / job_id / "preview" / "mp3" / "vocals.mp3")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "preview_status": "ready",
+        "preview_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.mp3"},
+        "preview_durations_seconds": {"vocals": 12.5},
+        "preview_file_info": {
+            "vocals": {
+                "path": mp3_path,
+                "size_bytes": 1234,
+                "duration_seconds": 12.5,
+                "media_type": "audio/mpeg",
+            }
+        },
+        "preview_stem_paths": {"vocals": mp3_path},
+    }
+
+    response = client.get(f"/api/debug/job/{job_id}", headers=auth_headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"] == job_id
+    assert payload["preview_status"] == "ready"
+    assert payload["preview_urls"]["vocals"].endswith(".mp3")
+    assert payload["mp3_paths"]["vocals"].endswith(".mp3")
+    assert payload["mp3_file_sizes"]["vocals"] == 1234
+    assert payload["ffprobe_durations"]["vocals"] == 12.5
+    assert payload["media_type"]["vocals"] == "audio/mpeg"
+    assert payload["preview_files"]["vocals"]["filename"] == "vocals.mp3"
+    assert payload["preview_files"]["vocals"]["exists"] is False
+    assert payload["preview_files"]["vocals"]["physical_paths"][0].endswith(
+        "vocals.mp3"
+    )
+
+
 def test_checkout_uses_disk_job_after_memory_cache_clear(monkeypatch):
     headers = auth_headers()
     job_id = "disk-checkout-job"
@@ -1113,23 +1172,43 @@ def test_preview_stem_is_served_without_auth_or_payment(tmp_path, monkeypatch):
     job_id = "free-preview-test"
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
-    job_dir = tmp_path / job_id / "mdx_q" / "preview"
+    job_dir = tmp_path / job_id / "preview" / "mp3"
     job_dir.mkdir(parents=True)
-    stem_path = job_dir / "vocals.wav"
-    stem_path.write_bytes(b"wav" * 800)
+    stem_path = job_dir / "vocals.mp3"
+    stem_path.write_bytes(b"mp3" * 800)
     main.JOBS[job_id] = {
         "job_id": job_id,
         "user_uid": "test-uid",
         "status": "done",
+        "preview_status": "ready",
+        "preview_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.mp3"},
+        "stem_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.mp3"},
+        "preview_stem_paths": {"vocals": str(stem_path)},
+    }
+
+    response = client.get(f"/api/preview/{job_id}/stem/vocals.mp3")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.content == stem_path.read_bytes()
+
+
+def test_preview_stem_rejects_wav_browser_urls(tmp_path, monkeypatch):
+    job_id = "reject-wav-preview-test"
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "preview_status": "ready",
         "preview_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.wav"},
         "stem_urls": {"vocals": f"/api/preview/{job_id}/stem/vocals.wav"},
     }
 
     response = client.get(f"/api/preview/{job_id}/stem/vocals.wav")
 
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "audio/wav"
-    assert response.content == stem_path.read_bytes()
+    assert response.status_code == 404
 
 
 def test_download_zip_returns_ready_archive(tmp_path, monkeypatch):
