@@ -1334,6 +1334,69 @@ def test_download_zip_allowed_after_stripe_api_verifies_payment(tmp_path, monkey
     assert response.headers["content-type"] == "application/zip"
 
 
+def test_job_status_unlocks_ready_full_downloads_after_payment(monkeypatch):
+    job_id = "ready-before-paid-job"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    job_dir = main.job_dir_for(job_id)
+    full_dir = job_dir / "full"
+    full_dir.mkdir(parents=True)
+    stem_path = full_dir / "vocals.wav"
+    stem_path.write_bytes(b"full-vocals")
+    zip_path = job_dir / "stemify_song_wav.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.write(stem_path, arcname="vocals.wav")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "payment_status": "pending",
+        "full_processing_status": "ready",
+        "zip_path": str(zip_path),
+        "full_stem_paths": {"vocals": str(stem_path)},
+        "download_urls": {
+            "zip": f"/api/download/{job_id}/zip",
+            "stems": {"vocals": f"/api/download/{job_id}/stem/vocals.wav"},
+        },
+        "download_stem_urls": {"vocals": f"/api/download/{job_id}/stem/vocals.wav"},
+    }
+
+    unpaid_response = client.get(f"/api/job/{job_id}", headers=headers)
+    assert unpaid_response.status_code == 200
+    unpaid_payload = unpaid_response.json()
+    assert unpaid_payload["payment_status"] == "pending"
+    assert unpaid_payload["download_urls"] == {"zip": None, "stems": {}}
+
+    main.mark_checkout_session_paid(
+        {
+            "id": "cs_ready_before_paid",
+            "payment_status": "paid",
+            "payment_intent": "pi_ready_before_paid",
+            "metadata": {
+                "job_id": job_id,
+                "item_type": "song",
+                "user_uid": "test-uid",
+            },
+        },
+        verification_source="api",
+    )
+
+    paid_response = client.get(f"/api/job/{job_id}", headers=headers)
+    assert paid_response.status_code == 200
+    paid_payload = paid_response.json()
+    assert paid_payload["payment_status"] == "paid"
+    assert paid_payload["full_processing_status"] == "ready"
+    assert paid_payload["download_urls"]["zip"] == f"/api/download/{job_id}/zip"
+    assert paid_payload["download_urls"]["stems"] == {
+        "vocals": f"/api/download/{job_id}/stem/vocals.wav"
+    }
+
+    download_response = client.get(
+        paid_payload["download_urls"]["zip"], headers=headers
+    )
+    assert download_response.status_code == 200
+
+
 def test_download_zip_allowed_after_webhook_confirms_payment(tmp_path, monkeypatch):
     job_id = "webhook-paid-zip-test"
     headers = auth_headers()

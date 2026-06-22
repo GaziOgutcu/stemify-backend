@@ -948,6 +948,44 @@ def path_map_for_job(paths_by_name: dict[str, Path]) -> dict[str, str]:
     return {name: str(path) for name, path in paths_by_name.items()}
 
 
+def paid_download_urls_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    stem_paths = job.get("full_stem_paths") or {}
+    stem_urls = {
+        public_name: f"/api/download/{job_id}/stem/{Path(path).name}"
+        for public_name, path in stem_paths.items()
+        if path
+    }
+    return {"zip": f"/api/download/{job_id}/zip", "stems": stem_urls}
+
+
+def unlock_ready_paid_assets(job_id: str, job: dict[str, Any]) -> dict[str, Any] | None:
+    zip_path = Path(job["zip_path"]) if job.get("zip_path") else None
+    zip_exists = bool(zip_path and zip_path.is_file())
+    stem_paths = {
+        name: Path(path)
+        for name, path in (job.get("full_stem_paths") or {}).items()
+        if path
+    }
+    stems_exist = bool(stem_paths) and all(
+        path.is_file() for path in stem_paths.values()
+    )
+    if not (zip_exists and stems_exist):
+        return None
+
+    download_urls = paid_download_urls_for_job(job_id, job)
+    updates = {
+        "status": "done",
+        "status_detail": "Payment verified. Full paid stems and ZIP are ready.",
+        "full_processing_status": "ready",
+        "zip_url": download_urls["zip"],
+        "full_stems": download_urls["stems"],
+        "download_stem_urls": download_urls["stems"],
+        "download_urls": download_urls,
+    }
+    update_job(job_id, **updates)
+    return {**job, **updates}
+
+
 def create_zip(zip_path: Path, stem_files: list[Path]) -> Path:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for stem_file in stem_files:
@@ -1296,13 +1334,39 @@ def mark_checkout_session_paid(
         if job_id in JOBS and JOBS[job_id].get("user_uid") == user_uid:
             JOBS[job_id].update(paid_job_updates)
             should_start_paid_assets = not JOBS[job_id].get("zip_url")
+    if job_id in JOBS:
+        with JOBS_LOCK:
+            memory_job = JOBS.get(job_id, {}).copy()
+        if memory_job.get("user_uid") == user_uid:
+            unlocked_job = unlock_ready_paid_assets(job_id, memory_job)
+            if unlocked_job:
+                with JOBS_LOCK:
+                    if job_id in JOBS:
+                        JOBS[job_id].update(unlocked_job)
+                should_start_paid_assets = False
     if job_json_path(job_id).is_file():
         disk_job = load_job_json(job_id)
         if disk_job.get("user_uid") == user_uid:
+            disk_job.update(paid_job_updates)
+            unlocked_job = unlock_ready_paid_assets(job_id, disk_job)
+            if unlocked_job:
+                disk_job = unlocked_job
             should_start_paid_assets = should_start_paid_assets or not disk_job.get(
                 "zip_url"
             )
             update_job(job_id, **paid_job_updates)
+    latest_job = (
+        get_public_job(job_id)
+        if job_json_path(job_id).is_file() or job_id in JOBS
+        else {}
+    )
+    zip_path = Path(latest_job["zip_path"]) if latest_job.get("zip_path") else None
+    audio_logger.info(
+        "Payment confirmed for job_id=%s full_processing_status=%s zip_path_exists=%s",
+        job_id,
+        latest_job.get("full_processing_status"),
+        bool(zip_path and zip_path.is_file()),
+    )
     if should_start_paid_assets:
         start_paid_assets_generation(job_id)
     with PAYMENTS_LOCK:
@@ -1340,6 +1404,9 @@ def ensure_paid_assets_ready(
     except HTTPException as exc:
         log_preview_response(exc.status_code)
         raise
+    unlocked_job = unlock_ready_paid_assets(job_id, job)
+    if unlocked_job:
+        return serialize_job(unlocked_job)
     if job.get("zip_url"):
         return job
     if job.get("payment_status") != "paid":
@@ -2002,6 +2069,10 @@ async def job_status(
     job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
 ):
     job = get_authorized_job(job_id, user)
+    if job.get("payment_status") == "paid":
+        unlocked_job = unlock_ready_paid_assets(job_id, job)
+        if unlocked_job:
+            job = serialize_job(unlocked_job)
     response_job = dict(job)
     for key in ("preview_stems", "stem_urls", "preview_urls"):
         urls = response_job.get(key)
@@ -2009,6 +2080,18 @@ async def job_status(
             response_job[key] = {
                 name: url for name, url in urls.items() if str(url).endswith(".mp3")
             }
+    if response_job.get("payment_status") != "paid":
+        response_job["zip_url"] = None
+        response_job["download_stem_urls"] = {}
+        response_job["download_urls"] = {"zip": None, "stems": {}}
+        response_job["full_stems"] = {}
+    zip_path = Path(job["zip_path"]) if job.get("zip_path") else None
+    audio_logger.info(
+        "/api/job/%s paid_download_urls_returned=%s zip_path_exists=%s",
+        job_id,
+        json.dumps(response_job.get("download_urls"), default=str),
+        bool(zip_path and zip_path.is_file()),
+    )
     audio_logger.info(
         "[PREVIEW] /api/job/%s response: %s",
         job_id,
@@ -2023,7 +2106,9 @@ async def job_status(
 
 
 @app.get("/api/debug/job/{job_id}")
-async def debug_job(job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
+async def debug_job(
+    job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
+):
     job = get_authorized_job(job_id, user)
     return JSONResponse(preview_debug_payload(job_id, job))
 
