@@ -15,7 +15,7 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
 - `POST /api/split` - multipart form upload with:
   - `file`: `.mp3`, `.wav`, `.flac`, `.aac`, `.ogg`, or `.m4a`
   - `stems`: always `2` for vocals and instrumental
-  - `output_format`: optional `wav`, `mp3`, `flac`, `ogg`, or `m4a` for the generated download files; defaults to `wav`
+  - `output_format`: optional `wav`, `mp3`, `flac`, `ogg`, or `m4a` for the generated download files; defaults to `mp3`
   - `quality`: optional `fast` or `high`; defaults to `fast` for backward-compatible uploads
 - `GET /api/job/{job_id}` - poll job status until it is `done` or `error`.
 - `GET /api/download/{job_id}/zip` - download all produced stems as a ZIP.
@@ -94,7 +94,11 @@ export async function splitTrack(file: File, firebaseIdToken: string) {
     headers: { Authorization: `Bearer ${firebaseIdToken}` },
     body: formData,
   });
-  if (!upload.ok) throw new Error(await upload.text());
+  if (!upload.ok) {
+    const errorText = await upload.text();
+    console.error("Split failed", upload.status, errorText);
+    throw new Error(errorText);
+  }
 
   const { job_id } = await upload.json();
 

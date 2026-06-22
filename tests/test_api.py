@@ -755,6 +755,58 @@ def test_split_creates_job_and_sanitizes_track_name(monkeypatch):
     client.delete(f"/api/cleanup/{payload['job_id']}", headers=headers)
 
 
+@pytest.mark.parametrize(
+    ("form_fields", "expected_format", "expected_quality"),
+    [
+        pytest.param(
+            {"stems": "2", "quality": "fast", "output_format": "mp3"},
+            "mp3",
+            "fast",
+            id="fast-mp3",
+        ),
+        pytest.param(
+            {"stems": "2", "quality": "fast", "output_format": "wav"},
+            "wav",
+            "fast",
+            id="fast-wav",
+        ),
+        pytest.param(
+            {"stems": "2", "quality": "high", "output_format": "mp3"},
+            "mp3",
+            "high",
+            id="high-mp3",
+        ),
+        pytest.param({"stems": "2"}, "mp3", "fast", id="missing-optional-fields"),
+    ],
+)
+def test_split_accepts_multipart_quality_and_output_format_defaults(
+    monkeypatch, form_fields, expected_format, expected_quality
+):
+    def fake_thread(*, target, args, daemon):
+        class DummyThread:
+            def start(self):
+                return None
+
+        return DummyThread()
+
+    monkeypatch.setattr(threading, "Thread", fake_thread)
+
+    headers = auth_headers()
+    response = client.post(
+        "/api/split",
+        files={"file": ("song.mp3", b"audio", "audio/mpeg")},
+        data=form_fields,
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["output_format"] == expected_format
+    assert payload["quality"] == expected_quality
+    assert main.JOBS[payload["job_id"]]["output_format"] == expected_format
+    assert main.JOBS[payload["job_id"]]["quality"] == expected_quality
+    client.delete(f"/api/cleanup/{payload['job_id']}", headers=headers)
+
 def test_download_stem_rejects_invalid_filename():
     response = client.get(
         "/api/download/example/stem/..%2Fsecret.wav", headers=auth_headers()
