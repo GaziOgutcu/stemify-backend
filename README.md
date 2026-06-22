@@ -18,10 +18,11 @@ FastAPI backend for uploading an audio file and splitting a 15-second preview in
   - `output_format`: optional `wav`, `mp3`, `flac`, `ogg`, or `m4a` for the generated download files; defaults to `wav`
 - `GET /api/job/{job_id}` - poll job status until it is `done` or `error`.
 - `GET /api/download/{job_id}/zip` - download all produced stems as a ZIP.
-- `GET /api/download/{job_id}/stem/{filename}` - download one stem in the requested output format.
+- `GET /api/preview/{job_id}/stem/{filename}` - stream a generated 15-second preview stem for browser audio players. These URLs are returned in `stem_urls` / `preview_urls` after the job is `done`.
+- `GET /api/download/{job_id}/stem/{filename}` - download one paid stem in the requested output format.
 - `DELETE /api/cleanup/{job_id}` - remove output files and forget the job.
 
-All split, job status, payment checkout/status, download, cleanup, and profile endpoints require an `Authorization: Bearer <firebase_id_token>` header from Firebase Google Sign-In. The Stripe webhook endpoint is called by Stripe and is verified with `STRIPE_WEBHOOK_SECRET`. Each submitted split job is tied to that signed-in Firebase user.
+All split, job status, payment checkout/status, download, cleanup, and profile endpoints require an `Authorization: Bearer <firebase_id_token>` header from Firebase Google Sign-In. Preview stem URLs under `/api/preview/...` are intentionally bearer-token-free because native browser audio elements cannot attach Firebase authorization headers; the unguessable job ID scopes access to the generated 15-second preview. The Stripe webhook endpoint is called by Stripe and is verified with `STRIPE_WEBHOOK_SECRET`. Each submitted split job is tied to that signed-in Firebase user.
 
 Job status responses include `status_detail`, `elapsed_seconds`, `timeout_seconds`, and `output_format` so the frontend can show a clear message instead of a vague "finalising" spinner. Downloads and checkout return `409` until the preview job status is `done`.
 
@@ -129,7 +130,7 @@ Production checklist for the frontend:
 2. Validate file extensions and display the backend size limit before upload.
 3. Disable the upload button while a job is processing.
 4. Poll `/api/job/{job_id}` every 2-5 seconds with the bearer token. Make sure the frontend starts only one polling interval per job and clears it when the job reaches `done` or `error`.
-5. Show the 15-second vocal/instrumental preview after `status === "done"`.
+5. Show the 15-second vocal/instrumental preview after `status === "done"` using `job.stem_urls` / `job.preview_urls`; these point to `/api/preview/...` URLs that can be assigned directly to `<audio src>` without custom headers.
 6. Let the user choose a download format (`wav`, `mp3`, `flac`, `ogg`, or `m4a`) before uploading; send it as `output_format`.
 7. If `PAYMENTS_ENABLED=true`, call `/api/create-checkout-session` when the user wants the full song and redirect them to the returned `checkout_url`. Do not put `STRIPE_SECRET_KEY` in frontend files such as `index.html`; it belongs only in Railway backend environment variables.
 8. For a static Vercel `index.html`, store the current `job_id`, selected filename, and UI state in `localStorage` as soon as `/api/split` returns. Stripe redirects back to `/?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=<job_id>` or `/?payment=cancelled&job_id=<job_id>`; parse those query params in `index.html`, but never unlock downloads from query params alone.
