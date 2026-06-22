@@ -195,6 +195,68 @@ def test_checkout_uses_static_frontend_root_redirects(monkeypatch):
     assert response.json()["checkout_session_id"] == "cs_live_static"
 
 
+def test_checkout_can_return_to_frontend_download_route(monkeypatch):
+    job_id = "checkout-return-path-job"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_live_backend_only")
+    monkeypatch.setattr(main, "FRONTEND_URL", "https://vocalsplitter.app")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "requested_stems": 2,
+    }
+
+    def fake_stripe_request(method, path, data=None):
+        assert (
+            data["success_url"]
+            == "https://vocalsplitter.app/download?payment=success&session_id={CHECKOUT_SESSION_ID}&job_id=checkout-return-path-job"
+        )
+        assert (
+            data["cancel_url"]
+            == "https://vocalsplitter.app/download?payment=cancelled&job_id=checkout-return-path-job"
+        )
+        return {"id": "cs_live_return", "url": "https://checkout.stripe.com/session"}
+
+    monkeypatch.setattr(main, "stripe_request", fake_stripe_request)
+
+    response = client.post(
+        "/api/create-checkout-session",
+        json={"job_id": job_id, "item_type": "song", "return_path": "/download"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["checkout_session_id"] == "cs_live_return"
+
+
+def test_checkout_rejects_absolute_return_path(monkeypatch):
+    job_id = "checkout-bad-return-job"
+    headers = auth_headers()
+    monkeypatch.setattr(main, "PAYMENTS_ENABLED", True)
+    monkeypatch.setattr(main, "STRIPE_SECRET_KEY", "sk_live_backend_only")
+    main.JOBS[job_id] = {
+        "job_id": job_id,
+        "user_uid": "test-uid",
+        "status": "done",
+        "requested_stems": 2,
+    }
+
+    response = client.post(
+        "/api/create-checkout-session",
+        json={
+            "job_id": job_id,
+            "item_type": "song",
+            "return_path": "https://evil.example/download",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert "relative frontend path" in response.json()["detail"]
+
+
 def test_checkout_reports_specific_configuration_error_when_payments_disabled(
     monkeypatch,
 ):

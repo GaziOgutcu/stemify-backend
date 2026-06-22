@@ -166,6 +166,7 @@ PAYMENTS_ENABLED = (
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "aud").lower()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+FRONTEND_RETURN_PATH = os.getenv("FRONTEND_RETURN_PATH", "/").strip() or "/"
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
@@ -201,6 +202,7 @@ class CheckoutRequest(BaseModel):
     job_id: str
     item_type: str = Field(default="song", pattern="^(song|zip|stem)$")
     filename: str | None = Field(default=None, max_length=120)
+    return_path: str | None = Field(default=None, max_length=300)
 
 
 class PaymentStatusRequest(BaseModel):
@@ -502,17 +504,52 @@ def json_loads(raw: bytes) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
-def checkout_success_url(job_id: str) -> str:
-    encoded_job_id = urllib.parse.quote(job_id, safe="")
-    return (
-        f"{FRONTEND_URL}/?payment=success"
-        f"&session_id={{CHECKOUT_SESSION_ID}}&job_id={encoded_job_id}"
+def normalize_frontend_return_path(return_path: str | None = None) -> str:
+    path = (return_path or FRONTEND_RETURN_PATH or "/").strip() or "/"
+    parsed = urlparse(path)
+    if parsed.scheme or parsed.netloc:
+        raise HTTPException(400, "return_path must be a relative frontend path.")
+    if not path.startswith(("/", "#", "?")):
+        path = f"/{path}"
+    return path
+
+
+def frontend_return_url(
+    payment_status: str, job_id: str, return_path: str | None = None
+) -> str:
+    parsed_frontend = urlparse(FRONTEND_URL)
+    parsed_return = urlparse(normalize_frontend_return_path(return_path))
+
+    query_params = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(
+            parsed_return.query, keep_blank_values=True
+        )
+        if key not in {"payment", "session_id", "job_id"}
+    ]
+    query_params.append(("payment", payment_status))
+    if payment_status == "success":
+        query_params.append(("session_id", "{CHECKOUT_SESSION_ID}"))
+    query_params.append(("job_id", job_id))
+
+    return urllib.parse.urlunparse(
+        (
+            parsed_frontend.scheme,
+            parsed_frontend.netloc,
+            parsed_return.path or "/",
+            "",
+            urllib.parse.urlencode(query_params, safe="{}"),
+            parsed_return.fragment,
+        )
     )
 
 
-def checkout_cancel_url(job_id: str) -> str:
-    encoded_job_id = urllib.parse.quote(job_id, safe="")
-    return f"{FRONTEND_URL}/?payment=cancelled&job_id={encoded_job_id}"
+def checkout_success_url(job_id: str, return_path: str | None = None) -> str:
+    return frontend_return_url("success", job_id, return_path)
+
+
+def checkout_cancel_url(job_id: str, return_path: str | None = None) -> str:
+    return frontend_return_url("cancelled", job_id, return_path)
 
 
 def retrieve_checkout_session(checkout_session_id: str) -> dict[str, Any]:
@@ -791,6 +828,8 @@ async def create_checkout_session(
     filename = None
 
     amount_cents, product_name = checkout_amount_for_job(job, payload.item_type)
+    success_url = checkout_success_url(payload.job_id, payload.return_path)
+    cancel_url = checkout_cancel_url(payload.job_id, payload.return_path)
     if amount_cents < 50:
         logger.error(
             "Checkout rejected for job_id=%s because amount_cents=%s",
@@ -806,8 +845,8 @@ async def create_checkout_session(
         amount_cents,
         PAYMENT_CURRENCY,
         stripe_key_mode(),
-        checkout_success_url(payload.job_id),
-        checkout_cancel_url(payload.job_id),
+        success_url,
+        cancel_url,
     )
     session = stripe_request(
         "POST",
@@ -815,8 +854,8 @@ async def create_checkout_session(
         {
             "mode": "payment",
             "customer_email": user["email"],
-            "success_url": checkout_success_url(payload.job_id),
-            "cancel_url": checkout_cancel_url(payload.job_id),
+            "success_url": success_url,
+            "cancel_url": cancel_url,
             "line_items[0][quantity]": "1",
             "line_items[0][price_data][currency]": PAYMENT_CURRENCY,
             "line_items[0][price_data][unit_amount]": str(amount_cents),
