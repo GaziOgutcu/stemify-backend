@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any
@@ -132,8 +133,8 @@ PREVIEW_DEMUCS_MODEL = os.getenv("PREVIEW_DEMUCS_MODEL", "mdx_q")
 FULL_DEMUCS_MODEL = os.getenv("FULL_DEMUCS_MODEL", DEMUCS_MODEL)
 PREVIEW_DEMUCS_TIMEOUT_SECONDS = int(os.getenv("PREVIEW_DEMUCS_TIMEOUT_SECONDS", "180"))
 DEMUCS_SHIFTS = int(os.getenv("DEMUCS_SHIFTS", "0"))
-DEMUCS_OVERLAP = float(os.getenv("DEMUCS_OVERLAP", "0.1"))
-DEMUCS_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_SEGMENT_SECONDS", "8")))
+DEMUCS_OVERLAP = float(os.getenv("DEMUCS_OVERLAP", "0.05"))  # 0.05 is enough for 15s preview; saves ~5% compute
+DEMUCS_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_SEGMENT_SECONDS", "0")))  # 0 = demucs default (no --segment flag = faster for short clips)
 DEMUCS_JOBS = int(os.getenv("DEMUCS_JOBS", "0"))
 DEMUCS_DEVICE = os.getenv("DEMUCS_DEVICE", "")
 DEMUCS_HIGH_MODEL = os.getenv("DEMUCS_HIGH_MODEL", "htdemucs")
@@ -143,7 +144,7 @@ DEMUCS_HIGH_OVERLAP = float(os.getenv("DEMUCS_HIGH_OVERLAP", "0.25"))
 DEMUCS_HIGH_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_HIGH_SEGMENT_SECONDS", "0")))
 DEMUCS_HIGH_JOBS = int(os.getenv("DEMUCS_HIGH_JOBS", str(DEMUCS_JOBS)))
 DEMUCS_HIGH_DEVICE = os.getenv("DEMUCS_HIGH_DEVICE", DEMUCS_DEVICE)
-DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
+DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "0"))  # 0 = let PyTorch auto-detect
 DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
 AUTO_START_FULL_AFTER_PREVIEW = (
     os.getenv("AUTO_START_FULL_AFTER_PREVIEW", "false").lower() == "true"
@@ -963,6 +964,8 @@ def create_preview_input(job_id: str, input_path: Path) -> Path:
         "-vn",
         "-acodec",
         "pcm_s16le",
+        "-threads",
+        "0",        # use all available CPU threads for decoding
         str(preview_path),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -977,6 +980,40 @@ def create_preview_input(job_id: str, input_path: Path) -> Path:
         preview_path.stat().st_size if preview_path.exists() else 0,
     )
     return preview_path
+
+
+def _convert_single_wav(
+    ffmpeg: str,
+    wav: Path,
+    converted: Path,
+    format_config: dict,
+    output_format: str,
+    job_id: str,
+    output_scope: str,
+) -> Path:
+    """Convert a single WAV to the target format. Runs in a thread."""
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(wav),
+        "-vn",
+        *format_config["ffmpeg_args"],
+        str(converted),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        err = (proc.stderr or "") + (proc.stdout or "")
+        raise RuntimeError(f"{output_format.upper()} export failed: {err[-400:]}")
+    validate_audio_file(converted, f"{output_format.upper()} {output_scope} stem")
+    audio_logger.info(
+        "Generated encoded %s stem job_id=%s path=%s size_bytes=%s",
+        output_scope,
+        job_id,
+        converted,
+        converted.stat().st_size,
+    )
+    return converted
 
 
 def prepare_output_files(
@@ -997,34 +1034,74 @@ def prepare_output_files(
     )
     converted_dir = base_dir / output_scope / output_format
     converted_dir.mkdir(parents=True, exist_ok=True)
-    converted_files: list[Path] = []
 
-    for wav in wavs:
-        converted = converted_dir / f"{wav.stem}{format_config['extension']}"
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(wav),
-            "-vn",
-            *format_config["ffmpeg_args"],
-            str(converted),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0:
-            err = (proc.stderr or "") + (proc.stdout or "")
-            raise RuntimeError(f"{output_format.upper()} export failed: {err[-400:]}")
-        validate_audio_file(converted, f"{output_format.upper()} {output_scope} stem")
-        audio_logger.info(
-            "Generated encoded %s stem job_id=%s path=%s size_bytes=%s",
-            output_scope,
-            job_id,
-            converted,
-            converted.stat().st_size,
-        )
-        converted_files.append(converted)
+    # Build (wav, output_path) pairs in original order
+    pairs = [
+        (wav, converted_dir / f"{wav.stem}{format_config['extension']}")
+        for wav in wavs
+    ]
+
+    converted_files: list[Path] = [Path()] * len(pairs)  # preserve order
+
+    with ThreadPoolExecutor(max_workers=len(pairs)) as executor:
+        future_to_index = {
+            executor.submit(
+                _convert_single_wav,
+                ffmpeg, wav, converted, format_config, output_format, job_id, output_scope,
+            ): i
+            for i, (wav, converted) in enumerate(pairs)
+        }
+        for future in as_completed(future_to_index):
+            i = future_to_index[future]
+            converted_files[i] = future.result()  # raises on error
 
     return converted_files
+
+
+def _convert_preview_wav_to_mp3(
+    ffmpeg: str,
+    wav: Path,
+    converted: Path,
+    job_id: str,
+) -> tuple[Path, dict]:
+    """Convert a single preview WAV to MP3. Runs in a thread."""
+    print(f"[JOB {job_id}] FFmpeg preview conversion starting: {wav.name}", flush=True)
+    cmd = [
+        ffmpeg, "-y", "-i", str(wav),
+        "-codec:a", "libmp3lame", "-b:a", "192k",
+        str(converted),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    size = converted.stat().st_size if converted.exists() else 0
+    duration = 0.0
+    validation_error = None
+    try:
+        if proc.returncode != 0:
+            err = (proc.stderr or "") + (proc.stdout or "")
+            raise RuntimeError(f"MP3 preview export failed: {err[-400:]}")
+        if not converted.is_file():
+            raise RuntimeError(f"MP3 preview was not created: {converted}")
+        if size <= 0:
+            raise RuntimeError(f"MP3 preview is empty: {converted}")
+        duration = audio_duration_seconds(converted)
+        if duration <= 0:
+            raise RuntimeError(f"MP3 preview has no playable duration: {converted}")
+    except RuntimeError as exc:
+        validation_error = str(exc)
+
+    public_name = public_stem_name(converted)
+    meta = {
+        "path": str(converted),
+        "input_wav_path": str(wav),
+        "size_bytes": size,
+        "duration_seconds": duration,
+        "ffmpeg_return_code": proc.returncode,
+        "media_type": "audio/mpeg",
+    }
+    print(f"[JOB {job_id}] {wav.name} -> MP3 done (rc={proc.returncode}, dur={duration:.2f}s, size={size})", flush=True)
+    if validation_error:
+        raise RuntimeError(validation_error)
+    return converted, meta
 
 
 def convert_preview_wavs_to_mp3(
@@ -1039,74 +1116,27 @@ def convert_preview_wavs_to_mp3(
     )
     converted_dir = base_dir / "preview" / "mp3"
     converted_dir.mkdir(parents=True, exist_ok=True)
-    converted_files: list[Path] = []
+
+    pairs = [(wav, converted_dir / f"{wav.stem}.mp3") for wav in wavs]
+    converted_files: list[Path] = [Path()] * len(pairs)
     preview_metadata: dict[str, dict[str, float | int | str]] = {}
 
-    for wav in wavs:
-        converted = converted_dir / f"{wav.stem}.mp3"
-        print(f"[JOB {job_id}] FFmpeg preview conversion starting", flush=True)
-        print(f"[JOB {job_id}] Preview WAV input: {wav}", flush=True)
-        print(f"[JOB {job_id}] Preview MP3 output: {converted}", flush=True)
-        audio_logger.info(
-            "[JOB %s] FFmpeg preview conversion starting input_wav_path=%s output_mp3_path=%s",
-            job_id,
-            wav,
-            converted,
-        )
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(wav),
-            "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            "192k",
-            str(converted),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        size = converted.stat().st_size if converted.exists() else 0
-        duration = 0.0
-        validation_error = None
-        try:
-            if proc.returncode != 0:
-                err = (proc.stderr or "") + (proc.stdout or "")
-                raise RuntimeError(f"MP3 preview export failed: {err[-400:]}")
-            if not converted.is_file():
-                raise RuntimeError(f"MP3 preview was not created: {converted}")
-            if size <= 0:
-                raise RuntimeError(f"MP3 preview is empty: {converted}")
-            duration = audio_duration_seconds(converted)
-            if duration <= 0:
-                raise RuntimeError(f"MP3 preview has no playable duration: {converted}")
-        except RuntimeError as exc:
-            validation_error = str(exc)
-
-        public_name = public_stem_name(converted)
-        preview_metadata[public_name] = {
-            "path": str(converted),
-            "input_wav_path": str(wav),
-            "size_bytes": size,
-            "duration_seconds": duration,
-            "ffmpeg_return_code": proc.returncode,
-            "media_type": "audio/mpeg",
+    with ThreadPoolExecutor(max_workers=len(pairs)) as executor:
+        future_to_index = {
+            executor.submit(_convert_preview_wav_to_mp3, ffmpeg, wav, converted, job_id): i
+            for i, (wav, converted) in enumerate(pairs)
         }
-        print(f"[JOB {job_id}] ffmpeg return code: {proc.returncode}", flush=True)
-        print(f"[JOB {job_id}] ffprobe duration: {duration}", flush=True)
-        print(f"[JOB {job_id}] MP3 size bytes: {size}", flush=True)
-        audio_logger.info(
-            "[JOB %s] Preview MP3 export input_wav_path=%s output_mp3_path=%s ffmpeg_return_code=%s ffprobe_duration=%.3f output_file_size_bytes=%s",
-            job_id,
-            wav,
-            converted,
-            proc.returncode,
-            duration,
-            size,
-        )
-        if validation_error:
-            raise RuntimeError(validation_error)
-        converted_files.append(converted)
+        for future in as_completed(future_to_index):
+            i = future_to_index[future]
+            converted_path, meta = future.result()  # raises on error
+            converted_files[i] = converted_path
+            preview_metadata[public_stem_name(converted_path)] = meta
 
+    audio_logger.info(
+        "[JOB %s] Parallel MP3 preview conversion complete: %s",
+        job_id,
+        [str(p) for p in converted_files],
+    )
     return converted_files, preview_metadata
 
 
@@ -1242,11 +1272,16 @@ def validate_audio_file(path: Path, label: str) -> dict[str, float | int | None]
             f"{label} is too small to be valid audio ({size} bytes): {path}"
         )
 
-    duration = audio_duration_seconds(path)
+    # Run duration and RMS checks in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_duration = executor.submit(audio_duration_seconds, path)
+        f_rms = executor.submit(audio_rms_db, path)
+        duration = f_duration.result()
+        rms_db = f_rms.result()
+
     if duration <= 0:
         raise RuntimeError(f"{label} has no playable duration: {path}")
 
-    rms_db = audio_rms_db(path)
     if rms_db is None or rms_db <= SILENCE_RMS_DB_THRESHOLD:
         level = "-inf" if rms_db is None else f"{rms_db:.1f} dB"
         raise RuntimeError(
@@ -1311,7 +1346,9 @@ def unlock_ready_paid_assets(job_id: str, job: dict[str, Any]) -> dict[str, Any]
 
 
 def create_zip(zip_path: Path, stem_files: list[Path]) -> Path:
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    # Audio files (MP3, AAC, OGG, FLAC) are already compressed — using
+    # ZIP_DEFLATED burns CPU for zero size benefit.  ZIP_STORED is instant.
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
         for stem_file in stem_files:
             zf.write(stem_file, arcname=stem_file.name)
     return zip_path
@@ -1387,8 +1424,16 @@ def validate_paid_download_file(path: Path, job: dict[str, Any], label: str) -> 
 
 
 def validate_audio_files(paths: list[Path], label: str) -> None:
-    for path in paths:
-        validate_audio_file(path, f"{label} {path.name}")
+    """Validate all audio files in parallel for speed."""
+    if not paths:
+        return
+    with ThreadPoolExecutor(max_workers=len(paths)) as executor:
+        futures = {
+            executor.submit(validate_audio_file, path, f"{label} {path.name}"): path
+            for path in paths
+        }
+        for future in as_completed(futures):
+            future.result()  # re-raises any validation error
 
 
 def public_stem_name(path: Path) -> str:
@@ -2632,6 +2677,10 @@ def demucs_subprocess_env() -> dict[str, str]:
         env["MKL_NUM_THREADS"] = thread_count
         env["NUMEXPR_NUM_THREADS"] = thread_count
         env["TORCH_NUM_THREADS"] = thread_count
+    else:
+        # Remove any inherited thread pins so PyTorch/OMP can use all available cores
+        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "TORCH_NUM_THREADS"):
+            env.pop(key, None)
     return env
 
 
