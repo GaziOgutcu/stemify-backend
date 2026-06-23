@@ -1915,9 +1915,34 @@ def recover_or_restart_paid_processing(job_id: str, job: dict[str, Any]) -> dict
         return get_public_job(job_id)
 
     if status == "processing" and full_processing_is_stale(job):
+        restart_count = int(_safe_float(job.get("full_processing_restart_count"), 0))
+        if restart_count >= FULL_PROCESSING_MAX_RESTARTS:
+            audio_logger.error(
+                "Full processing stale after max restarts; marking failed job_id=%s restart_count=%s stale_seconds=%s",
+                job_id,
+                restart_count,
+                FULL_PROCESSING_STALE_SECONDS,
+            )
+            stale_lock = job_dir_for(job_id) / "full_processing.lock"
+            stale_lock.unlink(missing_ok=True)
+            with PAID_ASSET_LOCK:
+                event = PAID_ASSET_EVENTS.pop(job_id, None)
+                if event is not None:
+                    event.set()
+            update_job(
+                job_id,
+                full_processing_status="failed",
+                full_processing_error=(
+                    f"Full processing stayed stuck for more than {FULL_PROCESSING_STALE_SECONDS} seconds after payment. Please retry with a shorter file or contact support."
+                ),
+                status_detail="Full processing failed instead of spinning forever.",
+            )
+            return get_public_job(job_id)
+
         audio_logger.warning(
-            "Full processing stale; restarting job_id=%s stale_seconds=%s",
+            "Full processing stale; restarting job_id=%s restart_count=%s stale_seconds=%s",
             job_id,
+            restart_count + 1,
             FULL_PROCESSING_STALE_SECONDS,
         )
         stale_lock = job_dir_for(job_id) / "full_processing.lock"
@@ -1931,6 +1956,7 @@ def recover_or_restart_paid_processing(job_id: str, job: dict[str, Any]) -> dict
             full_processing_status="not_started",
             full_processing_error=None,
             error=None,
+            full_processing_restart_count=restart_count + 1,
             status_detail="Full processing was stuck and has been restarted.",
         )
         start_paid_assets_generation(job_id)
