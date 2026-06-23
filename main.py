@@ -20,6 +20,74 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
+# ── Modal client (optional — falls back to local Demucs if not configured) ───
+MODAL_TOKEN_ID     = os.getenv("MODAL_TOKEN_ID", "").strip()
+MODAL_TOKEN_SECRET = os.getenv("MODAL_TOKEN_SECRET", "").strip()
+MODAL_WORKSPACE    = os.getenv("MODAL_WORKSPACE", "").strip()
+MODAL_ENABLED = bool(MODAL_TOKEN_ID and MODAL_TOKEN_SECRET and MODAL_WORKSPACE)
+
+_modal_fn = None  # lazy-loaded Modal function handle
+
+def _get_modal_fn():
+    """Lazy-load the Modal Demucs function. Returns None if Modal is not configured."""
+    global _modal_fn
+    if not MODAL_ENABLED:
+        return None
+    if _modal_fn is not None:
+        return _modal_fn
+    try:
+        import modal
+        modal.config._token_id     = MODAL_TOKEN_ID
+        modal.config._token_secret = MODAL_TOKEN_SECRET
+        _app = modal.App.lookup("stemify-demucs", environment_name="main")
+        _modal_fn = modal.Function.lookup("stemify-demucs", "separate_stems")
+        print("[OK] Modal Demucs function loaded", flush=True)
+        return _modal_fn
+    except Exception as exc:
+        print(f"[WARN] Modal not available, falling back to local Demucs: {exc}", flush=True)
+        return None
+
+def run_demucs_modal(
+    input_path: Path,
+    model: str,
+    shifts: int,
+    overlap: float,
+    segment: int,
+    two_stems: bool,
+    output_dir: Path,
+    timeout: int = 300,
+) -> bool:
+    """
+    Run Demucs via Modal GPU. Returns True on success, False if Modal unavailable.
+    On success, writes WAV files into output_dir/<model>/<stem>.wav
+    """
+    fn = _get_modal_fn()
+    if fn is None:
+        return False
+    try:
+        audio_bytes = input_path.read_bytes()
+        stems: dict[str, bytes] = fn.remote(
+            audio_bytes,
+            input_path.name,
+            model=model,
+            two_stems=two_stems,
+            shifts=shifts,
+            overlap=overlap,
+            segment=segment,
+        )
+        # Write returned WAV bytes to expected output paths
+        stem_dir = output_dir / model / input_path.stem
+        stem_dir.mkdir(parents=True, exist_ok=True)
+        for stem_name, wav_bytes in stems.items():
+            out_path = stem_dir / f"{stem_name}.wav"
+            out_path.write_bytes(wav_bytes)
+            print(f"[Modal] Wrote {out_path} ({len(wav_bytes)} bytes)", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[Modal] Error, falling back to local: {exc}", flush=True)
+        return False
+# ─────────────────────────────────────────────────────────────────────────────
+
 from fastapi import (
     Depends,
     FastAPI,
@@ -2206,18 +2274,42 @@ def ensure_paid_assets_ready(
             input_path.stat().st_size,
         )
         with DEMUCS_SEMAPHORE:
-            proc = subprocess.run(
-                full_cmd,
-                capture_output=True,
-                text=True,
+            # ── Try Modal GPU first, fall back to local CPU ───────────────────
+            full_settings = QUALITY_SETTINGS["fast"]
+            full_model = full_demucs_model_for_stems(stems)
+            modal_success = run_demucs_modal(
+                input_path=input_path,
+                model=full_model,
+                shifts=full_settings["shifts"],
+                overlap=full_settings["overlap"],
+                segment=full_settings["segment_seconds"],
+                two_stems=(stems == 2),
+                output_dir=job_dir,
                 timeout=DEMUCS_TIMEOUT_SECONDS,
-                env=env,
             )
-        print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
-        print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
-        print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
-        if proc.returncode != 0:
-            err = (proc.stderr or "") + (proc.stdout or "")
+            if modal_success:
+                print(f"[JOB {job_id[:8]}] Modal GPU full separation complete", flush=True)
+                proc_returncode = 0
+                proc_stdout = ""
+                proc_stderr = ""
+            else:
+                proc = subprocess.run(
+                    full_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=DEMUCS_TIMEOUT_SECONDS,
+                    env=env,
+                )
+                proc_returncode = proc.returncode
+                proc_stdout = proc.stdout
+                proc_stderr = proc.stderr
+            # ─────────────────────────────────────────────────────────────────
+
+        print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc_stdout[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc_stderr[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc_returncode}", flush=True)
+        if proc_returncode != 0:
+            err = proc_stderr + proc_stdout
             update_job(
                 job_id,
                 status_detail="Full stem separation failed after payment verification.",
@@ -2738,19 +2830,43 @@ def run_demucs(
                 ),
             )
             print(f"[JOB {job_id[:8]}] Running: {' '.join(cmd)}", flush=True)
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=PREVIEW_DEMUCS_TIMEOUT_SECONDS,
-                env=env,
-            )
-        print(f"[JOB {job_id[:8]}] STDOUT:\n{proc.stdout[-2000:]}", flush=True)
-        print(f"[JOB {job_id[:8]}] STDERR:\n{proc.stderr[-2000:]}", flush=True)
-        print(f"[JOB {job_id[:8]}] RETURN CODE: {proc.returncode}", flush=True)
 
-        if proc.returncode != 0:
-            err = (proc.stderr or "") + (proc.stdout or "")
+            # ── Try Modal GPU first, fall back to local CPU ───────────────────
+            settings = demucs_settings_for_quality(stems, quality)
+            modal_success = run_demucs_modal(
+                input_path=preview_path,
+                model=settings["models"][stems],
+                shifts=settings["shifts"],
+                overlap=settings["overlap"],
+                segment=settings["segment_seconds"],
+                two_stems=(stems == 2),
+                output_dir=job_dir,
+                timeout=PREVIEW_DEMUCS_TIMEOUT_SECONDS,
+            )
+            if modal_success:
+                print(f"[JOB {job_id[:8]}] Modal GPU separation complete", flush=True)
+                proc_returncode = 0
+                proc_stdout = ""
+                proc_stderr = ""
+            else:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=PREVIEW_DEMUCS_TIMEOUT_SECONDS,
+                    env=env,
+                )
+                proc_returncode = proc.returncode
+                proc_stdout = proc.stdout
+                proc_stderr = proc.stderr
+            # ─────────────────────────────────────────────────────────────────
+
+        print(f"[JOB {job_id[:8]}] STDOUT:\n{proc_stdout[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] STDERR:\n{proc_stderr[-2000:]}", flush=True)
+        print(f"[JOB {job_id[:8]}] RETURN CODE: {proc_returncode}", flush=True)
+
+        if proc_returncode != 0:
+            err = proc_stderr + proc_stdout
             print(f"[JOB {job_id[:8]}] FAILED:\n{err[-800:]}")
             update_job(
                 job_id,
