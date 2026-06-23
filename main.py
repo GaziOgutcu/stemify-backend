@@ -140,7 +140,7 @@ DEMUCS_HIGH_DEVICE = os.getenv("DEMUCS_HIGH_DEVICE", DEMUCS_DEVICE)
 DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
 DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
 AUTO_START_FULL_AFTER_PREVIEW = (
-    os.getenv("AUTO_START_FULL_AFTER_PREVIEW", "true").lower() == "true"
+    os.getenv("AUTO_START_FULL_AFTER_PREVIEW", "false").lower() == "true"
 )
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 DEFAULT_OUTPUT_FORMAT = "mp3"
@@ -288,7 +288,7 @@ PREVIEW_DURATION_SECONDS = int(os.getenv("PREVIEW_DURATION_SECONDS", "15"))
 MIN_STEM_FILE_SIZE_BYTES = int(os.getenv("MIN_STEM_FILE_SIZE_BYTES", "1024"))
 SILENCE_RMS_DB_THRESHOLD = float(os.getenv("SILENCE_RMS_DB_THRESHOLD", "-90"))
 PRICE_PER_SONG_CENTS = int(
-    os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "300"))
+    os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "99"))
 )
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 PAYMENTS_ENABLED = (
@@ -296,6 +296,8 @@ PAYMENTS_ENABLED = (
     == "true"
 )
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "aud").lower()
+PAYMENT_TEST_MODE = os.getenv("PAYMENT_TEST_MODE", "false").lower() == "true"
+STRIPE_ALLOW_LIVE_PAYMENTS = os.getenv("STRIPE_ALLOW_LIVE_PAYMENTS", "false").lower() == "true"
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 FRONTEND_RETURN_PATH = os.getenv("FRONTEND_RETURN_PATH", "/").strip() or "/"
@@ -703,6 +705,14 @@ def validate_checkout_configuration() -> None:
             "Checkout rejected because STRIPE_SECRET_KEY has an invalid prefix."
         )
         raise HTTPException(503, "Stripe secret key is invalid on this server.")
+    if stripe_key_mode() == "live" and not STRIPE_ALLOW_LIVE_PAYMENTS:
+        logger.error(
+            "Checkout rejected because live Stripe key is configured but STRIPE_ALLOW_LIVE_PAYMENTS is not true."
+        )
+        raise HTTPException(
+            503,
+            "Live Stripe payments are disabled on this server. Set STRIPE_ALLOW_LIVE_PAYMENTS=true only when you intentionally want real charges.",
+        )
     parsed_frontend = urlparse(FRONTEND_URL)
     if parsed_frontend.scheme not in {"http", "https"} or not parsed_frontend.netloc:
         logger.error(
@@ -1442,6 +1452,9 @@ async def root():
             "enabled": PAYMENTS_ENABLED,
             "price_per_song_cents": PRICE_PER_SONG_CENTS,
             "currency": PAYMENT_CURRENCY,
+            "test_mode": PAYMENT_TEST_MODE,
+            "stripe_key_mode": stripe_key_mode(),
+            "live_payments_allowed": STRIPE_ALLOW_LIVE_PAYMENTS,
         },
     }
 
@@ -1559,8 +1572,49 @@ async def payments_config():
         "checkout_endpoint": "/api/create-checkout-session",
         "price_per_song_cents": PRICE_PER_SONG_CENTS,
         "currency": PAYMENT_CURRENCY,
+        "test_mode": PAYMENT_TEST_MODE,
+        "stripe_key_mode": stripe_key_mode(),
+        "live_payments_allowed": STRIPE_ALLOW_LIVE_PAYMENTS,
     }
 
+
+
+def create_local_test_payment(job: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    """Mark a job paid without contacting Stripe. Use only for development/testing."""
+    job_id = job["job_id"]
+    session_id = f"cs_test_local_{job_id}_{int(time.time())}"
+    payment = {
+        "checkout_session_id": session_id,
+        "payment_key": payment_key(job_id, "song", None),
+        "job_id": job_id,
+        "item_type": "song",
+        "filename": None,
+        "user_uid": user["uid"],
+        "user_email": user["email"],
+        "status": "paid",
+        "stripe_payment_status": "paid",
+        "stripe_verification_source": "local_test_mode",
+        "stripe_api_verified": True,
+        "amount_cents": PRICE_PER_SONG_CENTS,
+        "currency": PAYMENT_CURRENCY,
+    }
+    with PAYMENTS_LOCK:
+        PAYMENTS[session_id] = payment.copy()
+        USER_PAYMENT_JOBS.setdefault(user["uid"], set()).add(job_id)
+        _save_payments_to_disk()
+    paid_at = time.time()
+    update_job(
+        job_id,
+        paid=True,
+        payment_status="paid",
+        paid_at=paid_at,
+        expires_at=paid_at + DOWNLOAD_HISTORY_RETENTION_SECONDS,
+        checkout_session_id=session_id,
+        paid_checkout_session_id=session_id,
+        status_detail="Test payment approved. Preparing full downloads in the background.",
+    )
+    start_paid_assets_generation(job_id)
+    return payment
 
 @app.post("/api/payments/checkout")
 @app.post("/api/create-checkout-session")
@@ -1568,9 +1622,31 @@ async def create_checkout_session(
     payload: CheckoutRequest,
     user: Annotated[dict[str, Any], Depends(current_user)],
 ):
+    job = get_authorized_job(payload.job_id, user)
+
+    if PAYMENT_TEST_MODE:
+        if job.get("preview_status") != "ready" or job.get("status") != "done":
+            raise HTTPException(
+                409,
+                {
+                    "message": "Preview stems are not ready yet.",
+                    "preview_status": job.get("preview_status"),
+                    "status_detail": job.get("status_detail"),
+                },
+            )
+        payment = create_local_test_payment(job, user)
+        checkout_url = checkout_success_url(payload.job_id, payload.return_path).replace(
+            "{CHECKOUT_SESSION_ID}", payment["checkout_session_id"]
+        )
+        return {
+            "checkout_session_id": payment["checkout_session_id"],
+            "checkout_url": checkout_url,
+            "test_mode": True,
+            "message": "Test payment approved. No real Stripe charge was created.",
+        }
+
     validate_checkout_configuration()
 
-    job = get_authorized_job(payload.job_id, user)
     if job.get("preview_status") != "ready" or job.get("status") != "done":
         raise HTTPException(
             409,
@@ -1808,6 +1884,14 @@ def _paid_assets_worker(job_id: str) -> None:
             job_id, owns_processing=True, allow_unpaid_processing=True
         )
     except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        update_job(
+            job_id,
+            full_processing_status="failed",
+            status_detail="Full stem generation failed.",
+            full_processing_error=str(detail),
+            error=str(detail),
+        )
         audio_logger.exception(
             "Paid full stem generation failed job_id=%s error=%s", job_id, exc
         )
@@ -2101,20 +2185,25 @@ def payment_verification_response(
         "payment_status": payment.get("status", "pending"),
     }
     if payment.get("status") == "paid":
-        job = ensure_paid_assets_ready(payment["job_id"])
+        job = get_public_job(payment["job_id"])
         if job.get("user_uid") != user["uid"]:
             raise HTTPException(404, "Job not found")
+        if job.get("full_processing_status") not in {"ready", "processing"}:
+            start_paid_assets_generation(payment["job_id"])
+            job = get_public_job(payment["job_id"])
         response.update(
             {
-                "zip_url": job.get("zip_url"),
-                "stem_urls": job.get("download_stem_urls", {}),
+                "zip_url": job.get("zip_url") if job.get("full_processing_status") == "ready" else None,
+                "stem_urls": job.get("download_stem_urls", {}) if job.get("full_processing_status") == "ready" else {},
                 "download_urls": job.get(
                     "download_urls",
                     {
                         "zip": job.get("zip_url"),
                         "stems": job.get("download_stem_urls", {}),
                     },
-                ),
+                ) if job.get("full_processing_status") == "ready" else {"zip": None, "stems": {}},
+                "full_processing_status": job.get("full_processing_status"),
+                "job_status_detail": job.get("status_detail"),
             }
         )
     return response
@@ -2123,10 +2212,20 @@ def payment_verification_response(
 def verify_checkout_payment(
     checkout_session_id: str, job_id: str | None, user: dict[str, Any]
 ) -> dict[str, Any]:
-    validate_checkout_configuration()
-
     with PAYMENTS_LOCK:
         payment = PAYMENTS.get(checkout_session_id)
+
+    if checkout_session_id.startswith("cs_test_local_"):
+        if not payment:
+            raise HTTPException(404, "Test payment not found.")
+        if payment.get("user_uid") != user["uid"]:
+            raise HTTPException(404, "Payment not found.")
+        if job_id and payment.get("job_id") != job_id:
+            raise HTTPException(400, "Checkout Session does not belong to this job.")
+        return payment_verification_response(payment, user)
+
+    validate_checkout_configuration()
+
 
     if payment and payment.get("user_uid") != user["uid"]:
         raise HTTPException(404, "Payment not found.")
@@ -2528,7 +2627,7 @@ def run_demucs(
             job_id,
             status="done",
             preview_status="ready",
-            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready. Full downloads are preparing in the background.",
+            status_detail=(f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready. Pay to prepare full downloads." if not AUTO_START_FULL_AFTER_PREVIEW else f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready. Full downloads are preparing in the background."),
             stems=stem_names,
             preview_stems=preview_urls,
             zip_url=None,
