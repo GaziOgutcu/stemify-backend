@@ -10,8 +10,7 @@ COPY requirements-prod.txt .
 RUN pip install --no-cache-dir -r requirements-prod.txt
 
 # Pre-download models at build time so they're cached in the image
-RUN python -c "from demucs.pretrained import get_model; get_model('htdemucs')" || true
-RUN python -c "from demucs.pretrained import get_model; get_model('htdemucs_6s')" || true
+RUN python -c "from demucs.pretrained import get_model; get_model('mdx_q')" || true
 
 COPY . .
 RUN mkdir -p uploads outputs

@@ -131,6 +131,7 @@ DEMUCS_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_SEGMENT_SECONDS", "8")))
 DEMUCS_JOBS = int(os.getenv("DEMUCS_JOBS", "0"))
 DEMUCS_DEVICE = os.getenv("DEMUCS_DEVICE", "")
 DEMUCS_HIGH_MODEL = os.getenv("DEMUCS_HIGH_MODEL", "htdemucs")
+DEMUCS_WARM_MODELS = _split_csv_env("DEMUCS_WARM_MODELS", DEMUCS_MODEL)
 DEMUCS_HIGH_SHIFTS = int(os.getenv("DEMUCS_HIGH_SHIFTS", "1"))
 DEMUCS_HIGH_OVERLAP = float(os.getenv("DEMUCS_HIGH_OVERLAP", "0.25"))
 DEMUCS_HIGH_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_HIGH_SEGMENT_SECONDS", "0")))
@@ -138,6 +139,9 @@ DEMUCS_HIGH_JOBS = int(os.getenv("DEMUCS_HIGH_JOBS", str(DEMUCS_JOBS)))
 DEMUCS_HIGH_DEVICE = os.getenv("DEMUCS_HIGH_DEVICE", DEMUCS_DEVICE)
 DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
 DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
+AUTO_START_FULL_AFTER_PREVIEW = (
+    os.getenv("AUTO_START_FULL_AFTER_PREVIEW", "true").lower() == "true"
+)
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 DEFAULT_OUTPUT_FORMAT = "mp3"
 DOWNLOAD_HISTORY_RETENTION_SECONDS = int(os.getenv("DOWNLOAD_HISTORY_RETENTION_SECONDS", "86400"))
@@ -284,7 +288,7 @@ PREVIEW_DURATION_SECONDS = int(os.getenv("PREVIEW_DURATION_SECONDS", "15"))
 MIN_STEM_FILE_SIZE_BYTES = int(os.getenv("MIN_STEM_FILE_SIZE_BYTES", "1024"))
 SILENCE_RMS_DB_THRESHOLD = float(os.getenv("SILENCE_RMS_DB_THRESHOLD", "-90"))
 PRICE_PER_SONG_CENTS = int(
-    os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "99"))
+    os.getenv("PRICE_PER_SONG_CENTS", os.getenv("PRICE_PER_STEM_CENTS", "300"))
 )
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 PAYMENTS_ENABLED = (
@@ -1101,6 +1105,25 @@ def demucs_model_for_quality(stems: int, quality: str = "fast") -> str:
     return QUALITY_SETTINGS[normalize_quality(quality)]["models"][stems]
 
 
+def paid_full_quality_for_job(job: dict[str, Any]) -> str:
+    # Paid full downloads are latency-sensitive and currently only support two stems.
+    # Force the fastest configured two-stem path even if a preview requested high quality.
+    return "fast"
+
+
+def demucs_settings_for_quality(stems: int, quality: str = "fast") -> dict[str, Any]:
+    settings = QUALITY_SETTINGS[normalize_quality(quality)]
+    return {
+        "model": settings["models"][stems],
+        "shifts": settings["shifts"],
+        "overlap": settings["overlap"],
+        "segment_seconds": settings["segment_seconds"],
+        "jobs": settings["jobs"],
+        "device": settings["device"],
+        "stem_count": stems,
+    }
+
+
 def demucs_output_dir(
     job_dir: Path, input_audio_path: Path, stems: int, quality: str = "fast"
 ) -> Path:
@@ -1438,9 +1461,34 @@ async def health():
     }
 
 
+def warm_demucs_models() -> None:
+    for model_name in dict.fromkeys(DEMUCS_WARM_MODELS):
+        if not model_name:
+            continue
+        try:
+            from demucs.pretrained import get_model
+
+            started_at = time.monotonic()
+            get_model(model_name)
+            audio_logger.info(
+                "Warmed Demucs model model=%s seconds=%.3f",
+                model_name,
+                time.monotonic() - started_at,
+            )
+        except Exception as exc:
+            audio_logger.warning(
+                "Unable to warm Demucs model model=%s error=%s", model_name, exc
+            )
+
+
+def start_demucs_model_warmup() -> None:
+    threading.Thread(target=warm_demucs_models, daemon=True).start()
+
+
 @app.on_event("startup")
 async def startup_cleanup_expired_jobs() -> None:
     # Best-effort cleanup so old jobs and R2 files do not accumulate after deploy/restart.
+    start_demucs_model_warmup()
     try:
         cleanup_expired_jobs()
     except Exception as exc:
@@ -1683,7 +1731,10 @@ def mark_checkout_session_paid(
     with JOBS_LOCK:
         if job_id in JOBS and JOBS[job_id].get("user_uid") == user_uid:
             JOBS[job_id].update(paid_job_updates)
-            should_start_paid_assets = not JOBS[job_id].get("zip_url")
+            should_start_paid_assets = (
+                not JOBS[job_id].get("zip_url")
+                and JOBS[job_id].get("full_processing_status") != "processing"
+            )
     if job_id in JOBS:
         with JOBS_LOCK:
             memory_job = JOBS.get(job_id, {}).copy()
@@ -1701,8 +1752,9 @@ def mark_checkout_session_paid(
             unlocked_job = unlock_ready_paid_assets(job_id, disk_job)
             if unlocked_job:
                 disk_job = unlocked_job
-            should_start_paid_assets = should_start_paid_assets or not disk_job.get(
-                "zip_url"
+            should_start_paid_assets = should_start_paid_assets or (
+                not disk_job.get("zip_url")
+                and disk_job.get("full_processing_status") != "processing"
             )
             update_job(job_id, **paid_job_updates)
     latest_job = (
@@ -1752,7 +1804,9 @@ def start_paid_assets_generation(job_id: str) -> None:
 
 def _paid_assets_worker(job_id: str) -> None:
     try:
-        ensure_paid_assets_ready(job_id, owns_processing=True)
+        ensure_paid_assets_ready(
+            job_id, owns_processing=True, allow_unpaid_processing=True
+        )
     except Exception as exc:
         audio_logger.exception(
             "Paid full stem generation failed job_id=%s error=%s", job_id, exc
@@ -1764,7 +1818,9 @@ def log_preview_response(status_code: int) -> None:
 
 
 def ensure_paid_assets_ready(
-    job_id: str, owns_processing: bool = False
+    job_id: str,
+    owns_processing: bool = False,
+    allow_unpaid_processing: bool = False,
 ) -> dict[str, Any]:
     try:
         job = get_public_job(job_id)
@@ -1776,7 +1832,7 @@ def ensure_paid_assets_ready(
         return serialize_job(unlocked_job)
     if job.get("zip_url"):
         return job
-    if job.get("payment_status") != "paid":
+    if not allow_unpaid_processing and job.get("payment_status") != "paid":
         raise HTTPException(402, "Payment required before full processing.")
 
     if owns_processing:
@@ -1825,10 +1881,21 @@ def ensure_paid_assets_ready(
                     "full_processing_status"
                 ) == "ready" and latest_job.get("zip_path"):
                     return latest_job
-                if latest_job.get("full_processing_status") == "error":
+                if latest_job.get("full_processing_status") == "failed":
                     raise HTTPException(
-                        500, latest_job.get("error") or "Full processing failed."
+                        500,
+                        latest_job.get("full_processing_error")
+                        or latest_job.get("error")
+                        or "Full processing failed.",
                     )
+            update_job(
+                job_id,
+                status_detail="Full stem separation timed out while waiting for the active worker.",
+                full_processing_status="failed",
+                full_processing_error=(
+                    f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds waiting for full processing."
+                ),
+            )
             raise HTTPException(409, "Full stems are still processing.")
 
         original_input_path = job.get("original_input_path")
@@ -1854,20 +1921,31 @@ def ensure_paid_assets_ready(
         stems = int(job.get("requested_stems") or 2)
         track_name = job.get("track_name") or "track"
         output_format = job.get("output_format") or DEFAULT_OUTPUT_FORMAT
-        quality = normalize_quality(job.get("quality") or DEFAULT_QUALITY)
-        source_duration = job.get("source_duration_seconds")
+        quality = paid_full_quality_for_job(job)
+        source_duration = job.get("source_duration_seconds") or audio_duration_seconds(
+            input_path
+        )
 
+        settings = demucs_settings_for_quality(stems, quality)
         update_job(
             job_id,
-            status_detail=f"Payment verified. Separating the full track with {demucs_model_for_quality(stems, quality)} ({quality} quality).",
+            status_detail=f"Payment verified. Separating the full track with {settings['model']} ({quality} quality).",
             full_processing_status="processing",
         )
         full_cmd = build_demucs_command(job_dir, input_path, stems, quality)
         env = demucs_subprocess_env()
         full_demucs_dir = demucs_output_dir(job_dir, input_path, stems, quality)
+        processing_started_at = time.monotonic()
         audio_logger.info(
-            "Prepared paid full Demucs job job_id=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
+            "Paid full processing started job_id=%s input_duration_seconds=%.3f demucs_model=%s segment=%s shifts=%s overlap=%s stem_count=%s output_format=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
             job_id,
+            float(source_duration or 0),
+            settings["model"],
+            settings["segment_seconds"],
+            settings["shifts"],
+            settings["overlap"],
+            settings["stem_count"],
+            output_format,
             " ".join(full_cmd),
             full_demucs_dir,
             input_path,
@@ -1884,19 +1962,12 @@ def ensure_paid_assets_ready(
         print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
-        # Upload full stems and zip to R2
-        if R2_ENABLED and proc.returncode == 0:
-            try:
-                _r2_upload_full_outputs(job_id, job_dir)
-            except Exception as _r2_exc:
-                print(f"[R2] Upload failed (non-fatal): {_r2_exc}", flush=True)
-
         if proc.returncode != 0:
             err = (proc.stderr or "") + (proc.stdout or "")
             update_job(
                 job_id,
                 status_detail="Full stem separation failed after payment verification.",
-                full_processing_status="error",
+                full_processing_status="failed",
                 full_processing_error=f"Demucs error: {err[-400:]}",
             )
             raise HTTPException(500, "Full stem separation failed.")
@@ -1907,7 +1978,7 @@ def ensure_paid_assets_ready(
             update_job(
                 job_id,
                 status_detail="Full stem separation finished without the expected stem files.",
-                full_processing_status="error",
+                full_processing_status="failed",
                 full_processing_error=(
                     "Missing Demucs output files: "
                     + ", ".join(str(path) for path in missing_full_wavs)
@@ -1919,8 +1990,6 @@ def ensure_paid_assets_ready(
         full_output_files = prepare_output_files(
             job_id, full_wavs, output_format, "full"
         )
-        if full_output_files != full_wavs:
-            validate_audio_files(full_output_files, "Paid full stem")
         full_dir = job_dir / "full"
         full_dir.mkdir(parents=True, exist_ok=True)
         persisted_full_files: list[Path] = []
@@ -1944,11 +2013,30 @@ def ensure_paid_assets_ready(
         if R2_ENABLED:
             try:
                 for full_stem_file in full_output_files:
-                    r2_upload_file(full_stem_file, r2_key_for_full_stem(job_id, full_stem_file.name))
+                    r2_upload_file(
+                        full_stem_file,
+                        r2_key_for_full_stem(job_id, full_stem_file.name),
+                    )
                 r2_upload_file(zip_path, r2_key_for_zip(job_id, zip_path.name))
             except Exception as _r2_exc:
-                print(f"[R2] Final paid asset upload failed (non-fatal): {_r2_exc}", flush=True)
+                print(
+                    f"[R2] Final paid asset upload failed (non-fatal): {_r2_exc}",
+                    flush=True,
+                )
 
+        total_processing_seconds = time.monotonic() - processing_started_at
+        audio_logger.info(
+            "Paid full processing completed job_id=%s input_duration_seconds=%.3f demucs_model=%s segment=%s shifts=%s overlap=%s stem_count=%s output_format=%s total_processing_seconds=%.3f",
+            job_id,
+            float(source_duration or 0),
+            settings["model"],
+            settings["segment_seconds"],
+            settings["shifts"],
+            settings["overlap"],
+            settings["stem_count"],
+            output_format,
+            total_processing_seconds,
+        )
         ready_at = time.time()
         download_stem_urls = {
             public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
@@ -1973,12 +2061,33 @@ def ensure_paid_assets_ready(
             zip_path=str(zip_path),
         )
         return get_public_job(job_id)
+    except subprocess.TimeoutExpired as exc:
+        update_job(
+            job_id,
+            status_detail="Full stem separation timed out.",
+            full_processing_status="failed",
+            full_processing_error=(
+                f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds while preparing full downloads."
+            ),
+        )
+        raise HTTPException(500, "Full stem separation timed out.") from exc
+    except Exception as exc:
+        if not isinstance(exc, HTTPException):
+            update_job(
+                job_id,
+                status_detail="Full stem separation failed.",
+                full_processing_status="failed",
+                full_processing_error=str(exc),
+            )
+        raise
     finally:
         if "owns_lock" in locals() and owns_lock:
             lock_path.unlink(missing_ok=True)
-        event.set()
-        with PAID_ASSET_LOCK:
-            PAID_ASSET_EVENTS.pop(job_id, None)
+        if owns_processing:
+            with PAID_ASSET_LOCK:
+                event = PAID_ASSET_EVENTS.pop(job_id, None)
+                if event is not None:
+                    event.set()
 
 
 def payment_verification_response(
@@ -2332,7 +2441,7 @@ def run_demucs(
             update_job(
                 job_id,
                 status="error",
-                preview_status="error",
+                preview_status="failed",
                 status_detail="Preview stem separation failed.",
                 error=f"Demucs error: {err[-400:]}",
             )
@@ -2354,7 +2463,7 @@ def run_demucs(
             update_job(
                 job_id,
                 status="error",
-                preview_status="error",
+                preview_status="failed",
                 status_detail="Preview stem separation finished without the expected stem files.",
                 error=(
                     "Missing Demucs output files: "
@@ -2419,7 +2528,7 @@ def run_demucs(
             job_id,
             status="done",
             preview_status="ready",
-            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready. Complete payment to generate full stems and ZIP.",
+            status_detail=f"{PREVIEW_DURATION_SECONDS}-second preview stems are ready. Full downloads are preparing in the background.",
             stems=stem_names,
             preview_stems=preview_urls,
             zip_url=None,
@@ -2438,12 +2547,14 @@ def run_demucs(
             quality=quality,
         )
         print(f"[JOB {job_id[:8]}] Preview done: {stem_names}")
+        if AUTO_START_FULL_AFTER_PREVIEW:
+            start_paid_assets_generation(job_id)
 
     except subprocess.TimeoutExpired:
         update_job(
             job_id,
             status="error",
-            preview_status="error",
+            preview_status="failed",
             status_detail="Preview stem separation timed out.",
             error=f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds. Try a shorter track.",
         )
@@ -2451,7 +2562,7 @@ def run_demucs(
         update_job(
             job_id,
             status="error",
-            preview_status="error",
+            preview_status="failed",
             status_detail="Preview stem separation crashed.",
             error=str(exc),
         )
