@@ -124,6 +124,7 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
+FULL_PROCESSING_STALE_SECONDS = int(os.getenv("FULL_PROCESSING_STALE_SECONDS", str(DEMUCS_TIMEOUT_SECONDS + 180)))
 DEMUCS_MODEL = os.getenv("DEMUCS_MODEL", os.getenv("DEMUCS_MODEL_2_STEMS", "mdx_q"))
 # Preview must stay fast. Do not let a production DEMUCS_MODEL=htdemucs setting
 # accidentally make the first 15-second preview take minutes.
@@ -1877,11 +1878,83 @@ def _r2_upload_full_outputs(job_id: str, job_dir: Path) -> None:
     for zip_file in job_dir.glob("*.zip"):
         r2_upload_file(zip_file, r2_key_for_zip(job_id, zip_file.name))
 
+
+def full_processing_is_stale(job: dict[str, Any]) -> bool:
+    if job.get("full_processing_status") != "processing":
+        return False
+    started_at = _safe_float(job.get("full_processing_started_at"), 0.0)
+    # Older deployed jobs may not have full_processing_started_at. Fall back to
+    # updated_at/paid_at/created_at so they cannot spin forever.
+    if started_at <= 0:
+        started_at = (
+            _safe_float(job.get("updated_at"), 0.0)
+            or _safe_float(job.get("paid_at"), 0.0)
+            or _safe_float(job.get("created_at"), 0.0)
+        )
+    return bool(started_at and (time.time() - started_at) > FULL_PROCESSING_STALE_SECONDS)
+
+
+def recover_or_restart_paid_processing(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    """Keep paid jobs from spinning forever.
+
+    If a paid job has ready files, unlock it. If it is queued/not_started, start
+    the worker. If it has been processing longer than the configured stale window,
+    reset and restart once so stale lock files/Railway worker death do not trap the
+    UI in a permanent spinner.
+    """
+    unlocked = unlock_ready_paid_assets(job_id, job)
+    if unlocked:
+        return serialize_job(unlocked)
+
+    if job.get("payment_status") != "paid":
+        return job
+
+    status = job.get("full_processing_status")
+    if status in {None, "", "not_started"}:
+        start_paid_assets_generation(job_id)
+        return get_public_job(job_id)
+
+    if status == "processing" and full_processing_is_stale(job):
+        audio_logger.warning(
+            "Full processing stale; restarting job_id=%s stale_seconds=%s",
+            job_id,
+            FULL_PROCESSING_STALE_SECONDS,
+        )
+        stale_lock = job_dir_for(job_id) / "full_processing.lock"
+        stale_lock.unlink(missing_ok=True)
+        with PAID_ASSET_LOCK:
+            event = PAID_ASSET_EVENTS.pop(job_id, None)
+            if event is not None:
+                event.set()
+        update_job(
+            job_id,
+            full_processing_status="not_started",
+            full_processing_error=None,
+            error=None,
+            status_detail="Full processing was stuck and has been restarted.",
+        )
+        start_paid_assets_generation(job_id)
+        return get_public_job(job_id)
+
+    return job
+
 def start_paid_assets_generation(job_id: str) -> None:
+    # Idempotent starter: do not launch duplicate workers in the same process,
+    # but allow a later request to restart if the previous worker already ended
+    # and removed its event in the finally block.
     with PAID_ASSET_LOCK:
-        if job_id in PAID_ASSET_EVENTS:
+        existing_event = PAID_ASSET_EVENTS.get(job_id)
+        if existing_event is not None and not existing_event.is_set():
+            audio_logger.info("Full processing worker already active job_id=%s", job_id)
             return
         PAID_ASSET_EVENTS[job_id] = threading.Event()
+
+    update_job(
+        job_id,
+        full_processing_status="processing",
+        full_processing_started_at=time.time(),
+        status_detail="Payment verified. Full downloads are queued for processing.",
+    )
 
     thread = threading.Thread(
         target=_paid_assets_worker,
@@ -1968,7 +2041,19 @@ def ensure_paid_assets_ready(
             os.close(fd)
             owns_lock = True
         except FileExistsError:
-            owns_lock = False
+            lock_age = time.time() - lock_path.stat().st_mtime if lock_path.exists() else 0
+            if lock_age > FULL_PROCESSING_STALE_SECONDS:
+                audio_logger.warning(
+                    "Removing stale full_processing.lock job_id=%s lock_age=%.1f",
+                    job_id,
+                    lock_age,
+                )
+                lock_path.unlink(missing_ok=True)
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                owns_lock = True
+            else:
+                owns_lock = False
         if not owns_lock:
             deadline = time.time() + DEMUCS_TIMEOUT_SECONDS
             while time.time() < deadline:
@@ -2028,6 +2113,7 @@ def ensure_paid_assets_ready(
             job_id,
             status_detail=f"Payment verified. Separating the full track with {settings['model']} ({quality} quality).",
             full_processing_status="processing",
+            full_processing_started_at=time.time(),
         )
         full_cmd = build_full_demucs_command(job_dir, input_path, stems)
         env = demucs_subprocess_env()
@@ -2731,9 +2817,7 @@ async def job_status(
 ):
     job = get_authorized_job(job_id, user)
     if job.get("payment_status") == "paid":
-        unlocked_job = unlock_ready_paid_assets(job_id, job)
-        if unlocked_job:
-            job = serialize_job(unlocked_job)
+        job = recover_or_restart_paid_processing(job_id, job)
     response_job = dict(job)
     for key in ("preview_stems", "stem_urls", "preview_urls"):
         urls = response_job.get(key)
