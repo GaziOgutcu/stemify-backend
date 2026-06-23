@@ -1474,3 +1474,77 @@ def test_download_stem_rejects_recorded_preview_path(tmp_path, monkeypatch):
 
     assert response.status_code == 500
     assert "preview file" in response.json()["detail"]
+
+
+def test_paid_full_processing_uses_fast_two_stem_vocals_command(monkeypatch):
+    job_id = "paid-fast-full-job"
+    job_dir = main.job_dir_for(job_id)
+    input_path = job_dir / "input" / "song.mp3"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_bytes(b"audio")
+    write_test_job(
+        job_id,
+        original_input_path=str(input_path),
+        uploaded_file_path=str(input_path),
+        payment_status="paid",
+        quality="high",
+        output_format="wav",
+        source_duration_seconds=123.4,
+    )
+    commands = []
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        out_dir = main.demucs_output_dir(job_dir, input_path, 2, "fast")
+        out_dir.mkdir(parents=True)
+        (out_dir / "vocals.wav").write_bytes(b"v" * 2048)
+        (out_dir / "no_vocals.wav").write_bytes(b"i" * 2048)
+        return Proc()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main, "validate_audio_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "validate_paid_download_file", lambda *args, **kwargs: None)
+
+    job = main.ensure_paid_assets_ready(job_id)
+
+    assert job["full_processing_status"] == "ready"
+    assert len(commands) == 1
+    cmd = commands[0]
+    assert cmd[cmd.index("-n") + 1] == "mdx_q"
+    assert "htdemucs" not in cmd
+    assert "htdemucs_6s" not in cmd
+    assert cmd[cmd.index("--shifts") + 1] == "0"
+    assert float(cmd[cmd.index("--overlap") + 1]) <= 0.1
+    assert cmd[cmd.index("--segment") + 1] in {"8", "10"}
+    assert cmd[cmd.index("--two-stems") + 1] == "vocals"
+
+
+def test_paid_checkout_does_not_start_second_full_processing_job(monkeypatch):
+    job_id = "paid-already-processing-job"
+    write_test_job(job_id, full_processing_status="processing")
+    main.JOBS[job_id] = main.load_job_json(job_id)
+    started_jobs = []
+    monkeypatch.setattr(
+        main, "start_paid_assets_generation", lambda job_id: started_jobs.append(job_id)
+    )
+
+    payment = main.mark_checkout_session_paid(
+        {
+            "id": "cs_already_processing",
+            "payment_status": "paid",
+            "metadata": {
+                "job_id": job_id,
+                "item_type": "song",
+                "user_uid": "test-uid",
+            },
+        },
+        verification_source="api",
+    )
+
+    assert payment["status"] == "paid"
+    assert started_jobs == []
