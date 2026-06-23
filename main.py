@@ -33,6 +33,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+# ── R2 / S3 storage (optional — falls back to local if not configured) ──
+try:
+    import boto3
+    from botocore.client import Config as BotocoreConfig
+    _boto3_available = True
+except ImportError:
+    boto3 = None
+    _boto3_available = False
+# ──────────────────────────────────────────────────────────────────────────────
+
 if importlib.util.find_spec("static_ffmpeg"):
     import static_ffmpeg
 else:
@@ -130,6 +140,82 @@ DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
 DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 DEFAULT_OUTPUT_FORMAT = "mp3"
+
+# ── Cloudflare R2 config ──────────────────────────────────────────────────────
+R2_ENDPOINT_URL      = os.getenv("R2_ENDPOINT_URL", "").rstrip("/")
+R2_ACCESS_KEY_ID     = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME       = os.getenv("R2_BUCKET_NAME", "stemify-audio")
+R2_ENABLED = bool(
+    _boto3_available and R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY
+)
+
+def _get_r2_client():
+    if not R2_ENABLED:
+        return None
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=BotocoreConfig(signature_version="s3v4"),
+        region_name="auto",
+    )
+
+def r2_upload_file(local_path: Path, r2_key: str) -> bool:
+    """Upload a file to R2. Returns True on success."""
+    client = _get_r2_client()
+    if not client:
+        return False
+    try:
+        client.upload_file(str(local_path), R2_BUCKET_NAME, r2_key)
+        print(f"[R2] Uploaded {local_path} -> {r2_key}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[R2] Upload failed {r2_key}: {exc}", flush=True)
+        return False
+
+def r2_download_file(r2_key: str, local_path: Path) -> bool:
+    """Download a file from R2 to local path. Returns True on success."""
+    client = _get_r2_client()
+    if not client:
+        return False
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        client.download_file(R2_BUCKET_NAME, r2_key, str(local_path))
+        print(f"[R2] Downloaded {r2_key} -> {local_path}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[R2] Download failed {r2_key}: {exc}", flush=True)
+        return False
+
+def r2_key_for_input(job_id: str, filename: str) -> str:
+    return f"jobs/{job_id}/input/{filename}"
+
+def r2_key_for_full_stem(job_id: str, filename: str) -> str:
+    return f"jobs/{job_id}/full/{filename}"
+
+def r2_key_for_zip(job_id: str, filename: str) -> str:
+    return f"jobs/{job_id}/zip/{filename}"
+
+def r2_presigned_url(r2_key: str, expires_in: int = 604800) -> str | None:
+    """Generate a presigned URL valid for expires_in seconds (default 7 days)."""
+    client = _get_r2_client()
+    if not client:
+        return None
+    try:
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": R2_BUCKET_NAME, "Key": r2_key},
+            ExpiresIn=expires_in,
+        )
+        return url
+    except Exception as exc:
+        print(f"[R2] Presigned URL failed {r2_key}: {exc}", flush=True)
+        return None
+
+print(f"[OK] R2 storage: {'enabled' if R2_ENABLED else 'disabled (local fallback)'}", flush=True)
+# ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_QUALITY = "fast"
 
 OUTPUT_FORMATS = {
@@ -1410,6 +1496,19 @@ def mark_checkout_session_paid(
         return payment.copy()
 
 
+def _r2_upload_full_outputs(job_id: str, job_dir: Path) -> None:
+    """Upload all full stem files and zip to R2 after processing."""
+    if not R2_ENABLED:
+        return
+    full_dir = job_dir / "full"
+    if full_dir.is_dir():
+        for f in full_dir.rglob("*"):
+            if f.is_file():
+                r2_upload_file(f, r2_key_for_full_stem(job_id, f.name))
+    # Upload zip
+    for zip_file in job_dir.glob("*.zip"):
+        r2_upload_file(zip_file, r2_key_for_zip(job_id, zip_file.name))
+
 def start_paid_assets_generation(job_id: str) -> None:
     with PAID_ASSET_LOCK:
         if job_id in PAID_ASSET_EVENTS:
@@ -1513,7 +1612,16 @@ def ensure_paid_assets_ready(
 
         input_path = Path(original_input_path)
         if not input_path.is_file():
-            raise HTTPException(410, "Original upload is no longer available.")
+            # Try to restore from R2
+            if R2_ENABLED:
+                r2_key = r2_key_for_input(job_id, Path(original_input_path).name)
+                print(f"[R2] Local file missing, restoring from R2: {r2_key}", flush=True)
+                restored = r2_download_file(r2_key, input_path)
+                if not restored or not input_path.is_file():
+                    raise HTTPException(410, "Original upload is no longer available.")
+                print(f"[R2] Restored input file: {input_path}", flush=True)
+            else:
+                raise HTTPException(410, "Original upload is no longer available.")
 
         job_dir = job_dir_for(job_id)
         stems = int(job.get("requested_stems") or 2)
@@ -1549,6 +1657,12 @@ def ensure_paid_assets_ready(
         print(f"[JOB {job_id[:8]}] FULL STDOUT:\n{proc.stdout[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] FULL STDERR:\n{proc.stderr[-2000:]}", flush=True)
         print(f"[JOB {job_id[:8]}] FULL RETURN CODE: {proc.returncode}", flush=True)
+        # Upload full stems and zip to R2
+        if R2_ENABLED and proc.returncode == 0:
+            try:
+                _r2_upload_full_outputs(job_id, job_dir)
+            except Exception as _r2_exc:
+                print(f"[R2] Upload failed (non-fatal): {_r2_exc}", flush=True)
 
         if proc.returncode != 0:
             err = (proc.stderr or "") + (proc.stdout or "")
@@ -1801,6 +1915,9 @@ async def split_audio(
     input_path = input_dir / original_name
     input_path.write_bytes(contents)
     now = time.time()
+    # Upload original input to R2 for persistent storage
+    if R2_ENABLED:
+        r2_upload_file(input_path, r2_key_for_input(job_id, original_name))
 
     job_record = {
         "job_id": job_id,
@@ -2253,7 +2370,27 @@ async def download_zip(
         zips = sorted(job_dir.glob("*.zip"))
         zip_path = zips[0] if zips else None
     if zip_path is None or not zip_path.is_file():
-        raise HTTPException(404, "ZIP not ready yet.")
+        # Try R2
+        if R2_ENABLED and zip_path:
+            r2_key = r2_key_for_zip(job_id, zip_path.name)
+            r2_download_file(r2_key, zip_path)
+        if zip_path is None or not zip_path.is_file():
+            # Try any zip in R2
+            if R2_ENABLED:
+                client = _get_r2_client()
+                if client:
+                    try:
+                        resp = client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=f"jobs/{job_id}/zip/")
+                        objs = resp.get("Contents", [])
+                        if objs:
+                            r2_key = objs[0]["Key"]
+                            fname = Path(r2_key).name
+                            zip_path = job_dir_for(job_id) / fname
+                            r2_download_file(r2_key, zip_path)
+                    except Exception:
+                        pass
+            if zip_path is None or not zip_path.is_file():
+                raise HTTPException(404, "ZIP not ready yet.")
     reject_preview_paid_path(zip_path)
     return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
 
@@ -2281,6 +2418,13 @@ async def download_stem(
     if stem_path is None or stem_path.name != filename:
         matches = sorted(path for path in job_dir.rglob(filename) if path.is_file())
         stem_path = matches[0] if matches else None
+    if stem_path is None:
+        # Try R2
+        if R2_ENABLED:
+            r2_key = r2_key_for_full_stem(job_id, filename)
+            candidate = job_dir_for(job_id) / "full" / filename
+            if r2_download_file(r2_key, candidate):
+                stem_path = candidate
     if stem_path is None:
         raise HTTPException(404, "Stem not found.")
     validate_paid_download_file(stem_path, job, "Stem")
