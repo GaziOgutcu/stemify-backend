@@ -2835,7 +2835,7 @@ def run_demucs(
             settings = demucs_settings_for_quality(stems, quality)
             modal_success = run_demucs_modal(
                 input_path=preview_path,
-                model=settings["models"][stems],
+                model=demucs_model_for_quality(stems, quality),
                 shifts=settings["shifts"],
                 overlap=settings["overlap"],
                 segment=settings["segment_seconds"],
