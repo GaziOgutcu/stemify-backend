@@ -10,3 +10,4 @@ static-ffmpeg>=2.5
 torchcodec
 
 firebase-admin>=6.5.0
+modal>=0.73.0
