@@ -125,6 +125,11 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 DEMUCS_TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT_SECONDS", "900"))
 DEMUCS_MODEL = os.getenv("DEMUCS_MODEL", os.getenv("DEMUCS_MODEL_2_STEMS", "mdx_q"))
+# Preview must stay fast. Do not let a production DEMUCS_MODEL=htdemucs setting
+# accidentally make the first 15-second preview take minutes.
+PREVIEW_DEMUCS_MODEL = os.getenv("PREVIEW_DEMUCS_MODEL", "mdx_q")
+FULL_DEMUCS_MODEL = os.getenv("FULL_DEMUCS_MODEL", DEMUCS_MODEL)
+PREVIEW_DEMUCS_TIMEOUT_SECONDS = int(os.getenv("PREVIEW_DEMUCS_TIMEOUT_SECONDS", "180"))
 DEMUCS_SHIFTS = int(os.getenv("DEMUCS_SHIFTS", "0"))
 DEMUCS_OVERLAP = float(os.getenv("DEMUCS_OVERLAP", "0.1"))
 DEMUCS_SEGMENT_SECONDS = int(float(os.getenv("DEMUCS_SEGMENT_SECONDS", "8")))
@@ -306,7 +311,10 @@ FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
 
 STEM_MODELS = {
-    2: DEMUCS_MODEL,
+    2: PREVIEW_DEMUCS_MODEL,
+}
+FULL_STEM_MODELS = {
+    2: FULL_DEMUCS_MODEL,
 }
 QUALITY_SETTINGS = {
     "fast": {
@@ -1121,6 +1129,10 @@ def paid_full_quality_for_job(job: dict[str, Any]) -> str:
     return "fast"
 
 
+def full_demucs_model_for_stems(stems: int) -> str:
+    return FULL_STEM_MODELS[stems]
+
+
 def demucs_settings_for_quality(stems: int, quality: str = "fast") -> dict[str, Any]:
     settings = QUALITY_SETTINGS[normalize_quality(quality)]
     return {
@@ -1435,7 +1447,8 @@ async def root():
         "qualities": sorted(QUALITY_SETTINGS),
         "default_quality": DEFAULT_QUALITY,
         "performance": {
-            "demucs_model": DEMUCS_MODEL,
+            "preview_demucs_model": PREVIEW_DEMUCS_MODEL,
+            "full_demucs_model": FULL_DEMUCS_MODEL,
             "demucs_shifts": DEMUCS_SHIFTS,
             "demucs_overlap": DEMUCS_OVERLAP,
             "demucs_segment_seconds": DEMUCS_SEGMENT_SECONDS,
@@ -2016,9 +2029,9 @@ def ensure_paid_assets_ready(
             status_detail=f"Payment verified. Separating the full track with {settings['model']} ({quality} quality).",
             full_processing_status="processing",
         )
-        full_cmd = build_demucs_command(job_dir, input_path, stems, quality)
+        full_cmd = build_full_demucs_command(job_dir, input_path, stems)
         env = demucs_subprocess_env()
-        full_demucs_dir = demucs_output_dir(job_dir, input_path, stems, quality)
+        full_demucs_dir = full_demucs_output_dir(job_dir, input_path, stems)
         processing_started_at = time.monotonic()
         audio_logger.info(
             "Paid full processing started job_id=%s input_duration_seconds=%.3f demucs_model=%s segment=%s shifts=%s overlap=%s stem_count=%s output_format=%s command=%s output_dir=%s input_path=%s input_size_bytes=%s",
@@ -2056,7 +2069,7 @@ def ensure_paid_assets_ready(
             )
             raise HTTPException(500, "Full stem separation failed.")
 
-        full_wavs = expected_demucs_stem_files(job_dir, input_path, stems, quality)
+        full_wavs = expected_full_demucs_stem_files(job_dir, input_path, stems)
         missing_full_wavs = [path for path in full_wavs if not path.is_file()]
         if missing_full_wavs:
             update_job(
@@ -2429,6 +2442,47 @@ async def split_audio(
     )
 
 
+
+def build_full_demucs_command(job_dir: Path, input_audio_path: Path, stems: int) -> list[str]:
+    # Full processing uses its own model setting so preview speed cannot be affected
+    # by production full-quality model choices.
+    settings = QUALITY_SETTINGS["fast"].copy()
+    model = full_demucs_model_for_stems(stems)
+    cmd = [
+        sys.executable,
+        "-m",
+        "demucs",
+        "-n",
+        model,
+        "--out",
+        str(job_dir),
+        "--shifts",
+        str(settings["shifts"]),
+        "--overlap",
+        str(settings["overlap"]),
+    ]
+    if settings["segment_seconds"] > 0:
+        cmd += ["--segment", str(settings["segment_seconds"])]
+    if settings["jobs"] > 0:
+        cmd += ["--jobs", str(settings["jobs"])]
+    if settings["device"]:
+        cmd += ["--device", settings["device"]]
+    if stems == 2:
+        cmd += ["--two-stems", "vocals"]
+    cmd.append(str(input_audio_path))
+    return cmd
+
+
+def full_demucs_output_dir(job_dir: Path, input_audio_path: Path, stems: int) -> Path:
+    return job_dir / full_demucs_model_for_stems(stems) / input_audio_path.stem
+
+
+def expected_full_demucs_stem_files(job_dir: Path, input_audio_path: Path, stems: int) -> list[Path]:
+    output_dir = full_demucs_output_dir(job_dir, input_audio_path, stems)
+    if stems == 2:
+        return [output_dir / "vocals.wav", output_dir / "no_vocals.wav"]
+    return sorted(output_dir.glob("*.wav"))
+
 def build_demucs_command(
     job_dir: Path, input_audio_path: Path, stems: int, quality: str = "fast"
 ) -> list[str]:
@@ -2527,7 +2581,7 @@ def run_demucs(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=DEMUCS_TIMEOUT_SECONDS,
+                timeout=PREVIEW_DEMUCS_TIMEOUT_SECONDS,
                 env=env,
             )
         print(f"[JOB {job_id[:8]}] STDOUT:\n{proc.stdout[-2000:]}", flush=True)
@@ -2655,7 +2709,7 @@ def run_demucs(
             status="error",
             preview_status="failed",
             status_detail="Preview stem separation timed out.",
-            error=f"Timed out after {DEMUCS_TIMEOUT_SECONDS} seconds. Try a shorter track.",
+            error=f"Preview timed out after {PREVIEW_DEMUCS_TIMEOUT_SECONDS} seconds. Please try a shorter file or try again.",
         )
     except Exception as exc:
         update_job(
