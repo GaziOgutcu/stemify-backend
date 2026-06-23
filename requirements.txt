@@ -9,3 +9,4 @@ torchaudio>=2.0.0
 static-ffmpeg>=2.5
 torchcodec
 boto3>=1.34.0
+modal>=0.73.0
