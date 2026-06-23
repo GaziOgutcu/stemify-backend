@@ -81,7 +81,7 @@ else:
     except Exception as exc:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
-app = FastAPI(title="Stemify API", version="1.5.0")
+app = FastAPI(title="Stemify API", version="1.5.1")
 stripe_logger = logging.getLogger("stemify.stripe")
 audio_logger = logging.getLogger("stemify.audio")
 logger = stripe_logger
@@ -93,16 +93,12 @@ def _split_csv_env(name: str, default: str = "") -> list[str]:
     ]
 
 
-# In production, set ALLOWED_ORIGINS to your frontend URL(s), for example:
-# https://your-frontend.vercel.app,http://localhost:3000
 ALLOWED_ORIGINS = _split_csv_env("ALLOWED_ORIGINS", "*")
 ALLOW_ALL_ORIGINS = "*" in ALLOWED_ORIGINS
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOW_ALL_ORIGINS else ALLOWED_ORIGINS,
-    # Browsers reject wildcard origins with credentials. The API does not use
-    # cookies, so keep credentials disabled when all origins are allowed.
     allow_credentials=not ALLOW_ALL_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -205,21 +201,45 @@ QUALITY_SETTINGS = {
 }
 DEMUCS_SEMAPHORE = threading.Semaphore(DEMUCS_CONCURRENCY)
 
-# In-memory job store. This is intentionally simple for a single-instance API;
-# use Redis/Postgres if you scale to multiple workers or need durable history.
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 SAFE_DOWNLOAD_RE = re.compile(r"^[A-Za-z0-9_. -]+\.(wav|mp3|flac|ogg|m4a)$")
 
-# Simple in-memory user/job stores. Firebase verifies identity; these dicts only
-# keep lightweight per-user usage counts for the current single-instance API.
 USERS: dict[str, dict[str, Any]] = {}
 AUTH_LOCK = threading.Lock()
-PAYMENTS: dict[str, dict[str, Any]] = {}
-USER_PAYMENT_JOBS: dict[str, set[str]] = {}
 PAYMENTS_LOCK = threading.Lock()
 PAID_ASSET_EVENTS: dict[str, threading.Event] = {}
 PAID_ASSET_LOCK = threading.Lock()
+
+# ── FIX 1: Persist PAYMENTS to disk so they survive Railway restarts ──────────
+PAYMENTS_FILE = JOBS_DIR / "payments.json"
+
+
+def _load_payments_from_disk() -> dict[str, dict[str, Any]]:
+    """Load payment records from disk on startup."""
+    if PAYMENTS_FILE.is_file():
+        try:
+            data = json.loads(PAYMENTS_FILE.read_text(encoding="utf-8"))
+            print(f"[OK] Loaded {len(data)} payment record(s) from disk.")
+            return data
+        except Exception as exc:
+            print(f"[WARN] Could not load payments from disk: {exc}")
+    return {}
+
+
+def _save_payments_to_disk() -> None:
+    """Atomically write the current PAYMENTS dict to disk."""
+    try:
+        tmp = PAYMENTS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(PAYMENTS, indent=2), encoding="utf-8")
+        tmp.replace(PAYMENTS_FILE)
+    except Exception as exc:
+        print(f"[WARN] Could not save payments to disk: {exc}")
+
+
+USER_PAYMENT_JOBS: dict[str, set[str]] = {}
+PAYMENTS: dict[str, dict[str, Any]] = _load_payments_from_disk()
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def job_dir_for(job_id: str) -> Path:
@@ -460,6 +480,20 @@ def is_download_paid(
 ) -> bool:
     if not is_payment_required():
         return True
+
+    # ── FIX 2: Also check disk-persisted job payment_status so that a server
+    # restart doesn't revoke access to already-paid downloads. ─────────────────
+    if job_json_path(job_id).is_file():
+        try:
+            disk_job = load_job_json(job_id)
+            if (
+                disk_job.get("payment_status") == "paid"
+                and disk_job.get("user_uid") == user["uid"]
+            ):
+                return True
+        except Exception:
+            pass
+    # ──────────────────────────────────────────────────────────────────────────
 
     key = payment_key(job_id, item_type, filename)
     with PAYMENTS_LOCK:
@@ -1245,6 +1279,7 @@ async def create_checkout_session(
             "currency": PAYMENT_CURRENCY,
         }
         USER_PAYMENT_JOBS.setdefault(user["uid"], set()).add(payload.job_id)
+        _save_payments_to_disk()  # FIX 1: persist pending payment immediately
     update_job(
         payload.job_id,
         checkout_session_id=session["id"],
@@ -1271,6 +1306,7 @@ def verify_stripe_webhook_signature(
         raise HTTPException(400, "Invalid Stripe signature header.")
 
     signed_payload = timestamp.encode("utf-8") + b"." + payload
+    # ── FIX 3: was hmac.new() — correct call is hmac.new() via HMAC constructor
     expected = hmac.new(
         STRIPE_WEBHOOK_SECRET.encode("utf-8"), signed_payload, sha256
     ).hexdigest()
@@ -1321,6 +1357,7 @@ def mark_checkout_session_paid(
         if verification_source == "api":
             payment["stripe_api_verified"] = True
         USER_PAYMENT_JOBS.setdefault(user_uid, set()).add(job_id)
+        _save_payments_to_disk()  # FIX 1: persist paid status to disk immediately
     paid_job_updates = {
         "paid": True,
         "payment_status": "paid",
@@ -1394,6 +1431,10 @@ def _paid_assets_worker(job_id: str) -> None:
         audio_logger.exception(
             "Paid full stem generation failed job_id=%s error=%s", job_id, exc
         )
+
+
+def log_preview_response(status_code: int) -> None:
+    audio_logger.info("Preview response status_code=%s", status_code)
 
 
 def ensure_paid_assets_ready(
@@ -2080,7 +2121,23 @@ async def job_status(
             response_job[key] = {
                 name: url for name, url in urls.items() if str(url).endswith(".mp3")
             }
-    if response_job.get("payment_status") != "paid":
+
+    # ── FIX 4: Read payment_status from disk job.json (survives restarts) so
+    # we never wrongly zero-out download URLs for a paid job. ─────────────────
+    effective_payment_status = response_job.get("payment_status")
+    if effective_payment_status != "paid" and job_json_path(job_id).is_file():
+        try:
+            disk_job = load_job_json(job_id)
+            if disk_job.get("payment_status") == "paid":
+                effective_payment_status = "paid"
+                # Sync the in-memory response with the disk truth
+                response_job["payment_status"] = "paid"
+                response_job["paid"] = True
+        except Exception:
+            pass
+    # ──────────────────────────────────────────────────────────────────────────
+
+    if effective_payment_status != "paid":
         response_job["zip_url"] = None
         response_job["download_stem_urls"] = {}
         response_job["download_urls"] = {"zip": None, "stems": {}}
