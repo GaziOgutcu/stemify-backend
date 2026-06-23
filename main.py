@@ -91,7 +91,7 @@ else:
     except Exception as exc:
         print(f"[WARN] ffmpeg auto-configuration failed: {exc}")
 
-app = FastAPI(title="Stemify API", version="1.5.1")
+app = FastAPI(title="Stemify API", version="1.5.2")
 stripe_logger = logging.getLogger("stemify.stripe")
 audio_logger = logging.getLogger("stemify.audio")
 logger = stripe_logger
@@ -140,6 +140,7 @@ DEMUCS_CPU_THREADS = int(os.getenv("DEMUCS_CPU_THREADS", "2"))
 DEMUCS_CONCURRENCY = max(1, int(os.getenv("DEMUCS_CONCURRENCY", "1")))
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 DEFAULT_OUTPUT_FORMAT = "mp3"
+DOWNLOAD_HISTORY_RETENTION_SECONDS = int(os.getenv("DOWNLOAD_HISTORY_RETENTION_SECONDS", "86400"))
 
 # ── Cloudflare R2 config ──────────────────────────────────────────────────────
 R2_ENDPOINT_URL      = os.getenv("R2_ENDPOINT_URL", "").rstrip("/")
@@ -213,6 +214,40 @@ def r2_presigned_url(r2_key: str, expires_in: int = 604800) -> str | None:
     except Exception as exc:
         print(f"[R2] Presigned URL failed {r2_key}: {exc}", flush=True)
         return None
+
+def r2_delete_prefix(prefix: str) -> int:
+    """Delete all objects under an R2 prefix. Returns deleted object count."""
+    client = _get_r2_client()
+    if not client:
+        return 0
+
+    deleted_count = 0
+    continuation_token: str | None = None
+    try:
+        while True:
+            kwargs: dict[str, Any] = {"Bucket": R2_BUCKET_NAME, "Prefix": prefix}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = client.list_objects_v2(**kwargs)
+            objects = response.get("Contents") or []
+            if objects:
+                keys = [{"Key": item["Key"]} for item in objects if item.get("Key")]
+                for chunk_start in range(0, len(keys), 1000):
+                    chunk = keys[chunk_start : chunk_start + 1000]
+                    client.delete_objects(
+                        Bucket=R2_BUCKET_NAME,
+                        Delete={"Objects": chunk, "Quiet": True},
+                    )
+                    deleted_count += len(chunk)
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+        if deleted_count:
+            print(f"[R2] Deleted {deleted_count} object(s) under {prefix}", flush=True)
+        return deleted_count
+    except Exception as exc:
+        print(f"[R2] Delete prefix failed {prefix}: {exc}", flush=True)
+        return deleted_count
 
 print(f"[OK] R2 storage: {'enabled' if R2_ENABLED else 'disabled (local fallback)'}", flush=True)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,6 +399,129 @@ def find_job_by_checkout_session(checkout_session_id: str) -> dict[str, Any] | N
         if job.get("checkout_session_id") == checkout_session_id:
             return job
     return None
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def job_history_expires_at(job: dict[str, Any]) -> float:
+    """Return the expiry timestamp for download history and retained files."""
+    explicit_expiry = _safe_float(job.get("expires_at"), 0.0)
+    if explicit_expiry > 0:
+        return explicit_expiry
+    base = (
+        _safe_float(job.get("ready_at"), 0.0)
+        or _safe_float(job.get("paid_at"), 0.0)
+        or _safe_float(job.get("created_at"), 0.0)
+        or time.time()
+    )
+    return base + DOWNLOAD_HISTORY_RETENTION_SECONDS
+
+
+def is_job_expired(job: dict[str, Any], now: float | None = None) -> bool:
+    return job_history_expires_at(job) <= (now or time.time())
+
+
+def seconds_until_expiry(job: dict[str, Any], now: float | None = None) -> int:
+    return max(0, int(job_history_expires_at(job) - (now or time.time())))
+
+
+def delete_job_r2_objects(job_id: str) -> int:
+    """Delete all R2 objects for a job. Safe no-op when R2 is disabled."""
+    if not R2_ENABLED:
+        return 0
+    return r2_delete_prefix(f"jobs/{job_id}/")
+
+
+def cleanup_expired_jobs() -> dict[str, Any]:
+    """Remove expired jobs from local disk, memory, payment indexes, and R2."""
+    now = time.time()
+    cleaned: list[str] = []
+    errors: dict[str, str] = {}
+
+    for path in sorted(JOBS_DIR.glob("*/job.json")):
+        job_id = path.parent.name
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors[job_id] = f"Could not read job metadata: {exc}"
+            continue
+
+        if not is_job_expired(job, now):
+            continue
+
+        try:
+            delete_job_r2_objects(job_id)
+            shutil.rmtree(path.parent, ignore_errors=True)
+            output_dir = OUTPUT_DIR / job_id
+            if output_dir.exists():
+                shutil.rmtree(output_dir, ignore_errors=True)
+            upload_preview = UPLOAD_DIR / f"{job_id}_preview.wav"
+            upload_preview.unlink(missing_ok=True)
+            with JOBS_LOCK:
+                JOBS.pop(job_id, None)
+            with PAYMENTS_LOCK:
+                expired_sessions = [
+                    session_id
+                    for session_id, payment in PAYMENTS.items()
+                    if payment.get("job_id") == job_id
+                ]
+                for session_id in expired_sessions:
+                    PAYMENTS.pop(session_id, None)
+                for job_ids in USER_PAYMENT_JOBS.values():
+                    job_ids.discard(job_id)
+                if expired_sessions:
+                    _save_payments_to_disk()
+            cleaned.append(job_id)
+        except Exception as exc:
+            errors[job_id] = str(exc)
+
+    if cleaned or errors:
+        print(
+            f"[CLEANUP] expired_jobs cleaned={len(cleaned)} errors={len(errors)}",
+            flush=True,
+        )
+    return {"cleaned": cleaned, "errors": errors, "retention_seconds": DOWNLOAD_HISTORY_RETENTION_SECONDS}
+
+
+def compact_download_history_job(job: dict[str, Any]) -> dict[str, Any]:
+    job_id = job.get("job_id")
+    download_urls = job.get("download_urls") or {}
+    stem_urls = (
+        job.get("download_stem_urls")
+        or job.get("full_stems")
+        or download_urls.get("stems")
+        or {}
+    )
+    zip_url = job.get("zip_url") or download_urls.get("zip")
+    expires_at = job_history_expires_at(job)
+    created_at = _safe_float(job.get("created_at"), time.time())
+    ready_at = _safe_float(job.get("ready_at"), 0.0) or None
+
+    return {
+        "job_id": job_id,
+        "original_filename": job.get("original_filename") or job.get("track_name") or "Audio file",
+        "track_name": job.get("track_name") or Path(str(job.get("original_filename") or "Audio file")).stem,
+        "output_format": job.get("requested_output_format") or job.get("output_format") or DEFAULT_OUTPUT_FORMAT,
+        "source_duration_seconds": job.get("source_duration_seconds"),
+        "created_at": created_at,
+        "paid_at": _safe_float(job.get("paid_at"), 0.0) or None,
+        "ready_at": ready_at,
+        "expires_at": expires_at,
+        "seconds_remaining": seconds_until_expiry(job),
+        "payment_status": job.get("payment_status"),
+        "full_processing_status": job.get("full_processing_status"),
+        "zip_url": zip_url or (f"/api/download/{job_id}/zip" if job_id else None),
+        "stem_urls": stem_urls,
+        "download_urls": {
+            "zip": zip_url or (f"/api/download/{job_id}/zip" if job_id else None),
+            "stems": stem_urls,
+        },
+    }
 
 
 class UserProfile(BaseModel):
@@ -1253,6 +1411,10 @@ async def root():
             "demucs_cpu_threads": DEMUCS_CPU_THREADS,
             "demucs_concurrency": DEMUCS_CONCURRENCY,
         },
+        "download_history": {
+            "retention_seconds": DOWNLOAD_HISTORY_RETENTION_SECONDS,
+            "retention_hours": round(DOWNLOAD_HISTORY_RETENTION_SECONDS / 3600, 2),
+        },
         "payments": {
             "enabled": PAYMENTS_ENABLED,
             "price_per_song_cents": PRICE_PER_SONG_CENTS,
@@ -1271,7 +1433,69 @@ async def health():
         "jobs_dir": str(JOBS_DIR),
         "output_formats": sorted(OUTPUT_FORMATS),
         "qualities": sorted(QUALITY_SETTINGS),
+        "download_history_retention_seconds": DOWNLOAD_HISTORY_RETENTION_SECONDS,
+        "r2_enabled": R2_ENABLED,
     }
+
+
+@app.on_event("startup")
+async def startup_cleanup_expired_jobs() -> None:
+    # Best-effort cleanup so old jobs and R2 files do not accumulate after deploy/restart.
+    try:
+        cleanup_expired_jobs()
+    except Exception as exc:
+        print(f"[CLEANUP] startup cleanup failed: {exc}", flush=True)
+
+
+@app.get("/api/my-jobs")
+async def my_jobs(user: Annotated[dict[str, Any], Depends(current_user)]):
+    # Opportunistic cleanup keeps history and R2 storage close to the 24-hour policy
+    # even without a separate cron job.
+    cleanup_expired_jobs()
+
+    jobs: list[dict[str, Any]] = []
+    now = time.time()
+    for path in sorted(JOBS_DIR.glob("*/job.json")):
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if job.get("user_uid") != user["uid"]:
+            continue
+        if job.get("payment_status") != "paid":
+            continue
+        if job.get("full_processing_status") != "ready":
+            continue
+        if is_job_expired(job, now):
+            continue
+
+        # Persist a computed expires_at for older jobs that do not have it yet.
+        if not job.get("expires_at"):
+            try:
+                update_job(job["job_id"], expires_at=job_history_expires_at(job))
+                job["expires_at"] = job_history_expires_at(job)
+            except Exception:
+                pass
+        jobs.append(compact_download_history_job(job))
+
+    jobs.sort(key=lambda item: item.get("ready_at") or item.get("paid_at") or item.get("created_at") or 0, reverse=True)
+    return JSONResponse(
+        {
+            "jobs": jobs,
+            "retention_seconds": DOWNLOAD_HISTORY_RETENTION_SECONDS,
+            "retention_hours": round(DOWNLOAD_HISTORY_RETENTION_SECONDS / 3600, 2),
+        }
+    )
+
+
+@app.post("/api/admin/cleanup-expired-jobs")
+async def admin_cleanup_expired_jobs(request: Request):
+    expected_secret = os.getenv("CLEANUP_SECRET", "").strip()
+    supplied_secret = request.headers.get("x-cleanup-secret", "").strip()
+    if not expected_secret or not hmac.compare_digest(expected_secret, supplied_secret):
+        raise HTTPException(403, "Forbidden")
+    return cleanup_expired_jobs()
 
 
 @app.get("/api/me", response_model=UserProfile)
@@ -1444,9 +1668,12 @@ def mark_checkout_session_paid(
             payment["stripe_api_verified"] = True
         USER_PAYMENT_JOBS.setdefault(user_uid, set()).add(job_id)
         _save_payments_to_disk()  # FIX 1: persist paid status to disk immediately
+    paid_at = time.time()
     paid_job_updates = {
         "paid": True,
         "payment_status": "paid",
+        "paid_at": paid_at,
+        "expires_at": paid_at + DOWNLOAD_HISTORY_RETENTION_SECONDS,
         "paid_checkout_session_id": session_id,
         "checkout_session_id": session_id,
         "stripe_payment_intent": session.get("payment_intent"),
@@ -1714,6 +1941,15 @@ def ensure_paid_assets_ready(
         create_zip(zip_path, full_output_files)
         reject_preview_paid_path(zip_path)
 
+        if R2_ENABLED:
+            try:
+                for full_stem_file in full_output_files:
+                    r2_upload_file(full_stem_file, r2_key_for_full_stem(job_id, full_stem_file.name))
+                r2_upload_file(zip_path, r2_key_for_zip(job_id, zip_path.name))
+            except Exception as _r2_exc:
+                print(f"[R2] Final paid asset upload failed (non-fatal): {_r2_exc}", flush=True)
+
+        ready_at = time.time()
         download_stem_urls = {
             public_stem_name(stem_file): f"/api/download/{job_id}/stem/{stem_file.name}"
             for stem_file in full_output_files
@@ -1724,6 +1960,8 @@ def ensure_paid_assets_ready(
             status="done",
             status_detail="Payment verified. Full paid stems and ZIP are ready.",
             full_processing_status="ready",
+            ready_at=ready_at,
+            expires_at=ready_at + DOWNLOAD_HISTORY_RETENTION_SECONDS,
             full_stems=download_stem_urls,
             zip_url=f"/api/download/{job_id}/zip",
             full_stem_paths=path_map_for_job(full_stem_paths_by_name),
@@ -1936,6 +2174,7 @@ async def split_audio(
         "error": None,
         "created_at": now,
         "updated_at": now,
+        "expires_at": now + DOWNLOAD_HISTORY_RETENTION_SECONDS,
         "status": "processing",
         "status_detail": f"Queued for {PREVIEW_DURATION_SECONDS}-second vocal/instrumental preview.",
         "stems": [],
@@ -2358,6 +2597,9 @@ async def download_zip(
     job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]
 ):
     job = get_authorized_job(job_id, user)
+    if is_job_expired(job):
+        cleanup_expired_jobs()
+        raise HTTPException(410, "This download has expired.")
     enforce_job_done(job)
     enforce_paid_download(job, user, "zip")
     job_dir = (
@@ -2405,6 +2647,9 @@ async def download_stem(
         raise HTTPException(400, "Invalid stem filename.")
 
     job = get_authorized_job(job_id, user)
+    if is_job_expired(job):
+        cleanup_expired_jobs()
+        raise HTTPException(410, "This download has expired.")
     enforce_job_done(job)
     enforce_paid_download(job, user, "stem", filename)
     job_dir = (
@@ -2436,9 +2681,22 @@ async def download_stem(
 @app.delete("/api/cleanup/{job_id}")
 async def cleanup(job_id: str, user: Annotated[dict[str, Any], Depends(current_user)]):
     get_authorized_job(job_id, user)
-    job_dir = OUTPUT_DIR / job_id
-    if job_dir.exists():
-        shutil.rmtree(job_dir)
+    delete_job_r2_objects(job_id)
+    for path in (OUTPUT_DIR / job_id, JOBS_DIR / job_id):
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
     with JOBS_LOCK:
         JOBS.pop(job_id, None)
+    with PAYMENTS_LOCK:
+        expired_sessions = [
+            session_id
+            for session_id, payment in PAYMENTS.items()
+            if payment.get("job_id") == job_id
+        ]
+        for session_id in expired_sessions:
+            PAYMENTS.pop(session_id, None)
+        for job_ids in USER_PAYMENT_JOBS.values():
+            job_ids.discard(job_id)
+        if expired_sessions:
+            _save_payments_to_disk()
     return {"status": "cleaned"}
